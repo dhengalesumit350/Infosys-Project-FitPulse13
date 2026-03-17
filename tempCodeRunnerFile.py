@@ -1,0 +1,2 @@
+        padding: 2rem;
+        border-radius: 12px;
