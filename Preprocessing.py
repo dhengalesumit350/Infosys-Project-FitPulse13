@@ -229,3 +229,6 @@ if st.session_state.ingested:
         st.session_state.clean_df.to_csv(buf, index=False)
         st.download_button("📥 DOWNLOAD FINAL OPTIMIZED DATASET", data=buf.getvalue(), file_name="FitPulse_Elite_Clean.csv", mime="text/csv", use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
+
+
+    
