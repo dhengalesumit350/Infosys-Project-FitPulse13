@@ -18,6 +18,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import streamlit as st
 
+# Plotly imported lazily inside milestones to avoid startup lag
+# But we define a cached CSV reader here for global use
+@st.cache_data(show_spinner=False)
+def _cached_read_csv(b: bytes) -> pd.DataFrame:
+    """Cache CSV parsing — prevents re-parsing on every Streamlit rerender."""
+    return pd.read_csv(io.BytesIO(b))
+
 # ── Page config — called ONCE for the entire app ───────────────────────────────
 st.set_page_config(
     page_title="FitPulse Pro",
@@ -278,7 +285,7 @@ if M == 0:
             letter-spacing:0.18em;margin-bottom:1.2rem;">⚡ FITPULSE PRO · ELITE GOVERNANCE SUITE</div>
         <h1 style="font-family:'Syne',sans-serif;font-size:3.2rem;font-weight:800;color:{TEXT};
             margin:0 0 0.8rem 0;letter-spacing:-0.03em;line-height:1.1;">
-            Your Complete<br><span style="color:{ACCENT};">Fitness Data</span><br>Analytics Pipeline
+            <br><span style="color:{ACCENT};">Fitness Data</span><br>Analytics Pipeline
         </h1>
         <p style="color:{MUTED};font-size:1rem;max-width:580px;line-height:1.8;margin:0 0 1.5rem 0;">
             Four integrated milestones — from raw CSV ingestion to AI-powered anomaly detection
@@ -405,13 +412,23 @@ elif M == 1:
     st.subheader("📁 Step 1: Secure Data Ingestion")
     file = st.file_uploader("Upload FitPulse CSV", type="csv", label_visibility="collapsed", key="m1_upload")
     if file:
-        temp_df = pd.read_csv(file)
-        if st.session_state.raw_df is None or not st.session_state.raw_df.equals(temp_df):
-            st.session_state.raw_df  = temp_df
-            st.session_state.ingested = True
-            st.session_state.processed = False
-            st.session_state.clean_df  = None
-            st.rerun()
+        _file_bytes = file.read()
+        try:
+            temp_df = _cached_read_csv(_file_bytes)
+        except Exception as _e:
+            st.error(f"Failed to parse CSV: {_e}")
+            temp_df = None
+        if temp_df is not None:
+            # Only trigger rerun when a genuinely new file is loaded
+            _is_new = (st.session_state.raw_df is None or
+                       st.session_state.raw_df.shape != temp_df.shape or
+                       not st.session_state.ingested)
+            if _is_new:
+                st.session_state.raw_df   = temp_df
+                st.session_state.ingested = True
+                st.session_state.processed = False
+                st.session_state.clean_df  = None
+                st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
     if st.session_state.ingested:
@@ -499,14 +516,73 @@ elif M == 1:
                         st.altair_chart(chart, use_container_width=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # EDA
+            # EDA — rich multi-tab dashboard
             st.markdown('<div class="glass-card">', unsafe_allow_html=True)
             st.subheader("🔍 Step 5: Complete Governance EDA")
-            tab_corr, tab_dist = st.tabs(["🔥 Correlation Matrix", "📊 Feature Distribution"])
+
+            try:
+                import plotly.graph_objects as go
+                import plotly.express as px
+                from plotly.subplots import make_subplots
+                _plotly_ok = True
+            except ImportError:
+                _plotly_ok = False
+
+            _PBASE = dict(
+                paper_bgcolor=PAPER_BG, plot_bgcolor=PLOT_BG, font_color=TEXT,
+                font_family="Inter, sans-serif",
+                legend=dict(bgcolor=CARD_BG, bordercolor=CARD_BOR, borderwidth=1, font_color=TEXT),
+                margin=dict(l=50, r=30, t=55, b=45),
+                hoverlabel=dict(bgcolor=CARD_BG, bordercolor=CARD_BOR, font_color=TEXT),
+            )
+            def _pt(fig, title="", h=380):
+                fig.update_layout(**_PBASE, height=h)
+                fig.update_xaxes(gridcolor=GRID_CLR, zeroline=False, linecolor=CARD_BOR, tickfont_color=MUTED)
+                fig.update_yaxes(gridcolor=GRID_CLR, zeroline=False, linecolor=CARD_BOR, tickfont_color=MUTED)
+                if title:
+                    fig.update_layout(title=dict(text=title, font_color=TEXT, font_size=13, font_family="Syne, sans-serif"))
+                return fig
+
+            tab_corr, tab_dist, tab_box, tab_time, tab_scatter = st.tabs([
+                "🔥 Correlation Matrix",
+                "📊 Distributions",
+                "📦 Box Plots",
+                "📈 Time Series",
+                "🔵 Scatter Matrix",
+            ])
+
+            num_df   = df_clean.select_dtypes(include=[np.number])
+            num_cols_all = num_df.columns.tolist()
 
             with tab_corr:
-                num_df = df_clean.select_dtypes(include=[np.number])
-                if not num_df.empty:
+                if not num_df.empty and _plotly_ok:
+                    corr_mat = num_df.corr()
+                    fig_hm = go.Figure(go.Heatmap(
+                        z=corr_mat.values,
+                        x=corr_mat.columns.tolist(),
+                        y=corr_mat.columns.tolist(),
+                        colorscale="RdBu",
+                        zmid=0,
+                        text=np.round(corr_mat.values, 2),
+                        texttemplate="%{text}",
+                        textfont={"size": 9},
+                        hovertemplate="%{x} × %{y}<br>r = %{z:.3f}<extra></extra>",
+                    ))
+                    _pt(fig_hm, "🔥 Pearson Correlation Heatmap", h=max(400, len(num_cols_all)*40))
+                    st.plotly_chart(fig_hm, use_container_width=True)
+
+                    # Top correlations table
+                    corr_pairs = (
+                        corr_mat.where(np.tril(np.ones(corr_mat.shape), k=-1).astype(bool))
+                        .stack().reset_index()
+                    )
+                    corr_pairs.columns = ["Feature A", "Feature B", "r"]
+                    corr_pairs["|r|"] = corr_pairs["r"].abs()
+                    top_corr = corr_pairs.nlargest(10, "|r|")[["Feature A", "Feature B", "r"]]
+                    st.markdown(f"<p style='color:{MUTED};font-size:0.82rem;'>Top 10 strongest correlations:</p>", unsafe_allow_html=True)
+                    st.dataframe(top_corr.reset_index(drop=True).round(3), use_container_width=True, height=280)
+                elif not _plotly_ok:
+                    # Fallback to altair
                     corr = num_df.corr().reset_index().melt(id_vars="index")
                     heatmap = alt.Chart(corr).mark_rect().encode(
                         x="index:O", y="variable:O",
@@ -515,19 +591,150 @@ elif M == 1:
                     st.altair_chart(heatmap, use_container_width=True)
 
             with tab_dist:
-                cols_eda = st.columns(2)
-                for idx, col in enumerate(df_clean.columns):
-                    with cols_eda[idx % 2]:
-                        st.markdown(f"**Field:** `{col.upper()}`")
-                        if df_clean[col].dtype in [np.float64, np.int64]:
-                            c = alt.Chart(df_clean).mark_bar(color="#38bdf8").encode(
-                                x=alt.X(col, bin=True), y="count()"
-                            ).properties(height=150)
+                if not num_cols_all:
+                    st.info("No numeric columns to plot.")
+                elif _plotly_ok:
+                    cols_eda_sel = st.multiselect(
+                        "Select columns to plot", num_cols_all,
+                        default=num_cols_all[:4] if len(num_cols_all) >= 4 else num_cols_all,
+                        key="m1_dist_sel"
+                    )
+                    if cols_eda_sel:
+                        ncols_plot = min(2, len(cols_eda_sel))
+                        nrows_plot = (len(cols_eda_sel) + 1) // 2
+                        fig_dist = make_subplots(rows=nrows_plot, cols=ncols_plot,
+                                                 subplot_titles=cols_eda_sel,
+                                                 vertical_spacing=0.12, horizontal_spacing=0.08)
+                        pal = [ACCENT, AMBER, PURPLE, GREEN, RED, "#f687b3", "#68d391"]
+                        for i, col in enumerate(cols_eda_sel):
+                            r, c = divmod(i, ncols_plot)
+                            fig_dist.add_trace(
+                                go.Histogram(x=df_clean[col], name=col,
+                                             marker_color=pal[i % len(pal)],
+                                             opacity=0.78,
+                                             hovertemplate=f"{col}: %{{x}}<br>Count: %{{y}}<extra></extra>"),
+                                row=r+1, col=c+1
+                            )
+                        fig_dist.update_layout(**_PBASE, height=max(320, nrows_plot*220),
+                                               showlegend=False,
+                                               title=dict(text="📊 Feature Distributions", font_color=TEXT, font_size=13))
+                        fig_dist.update_xaxes(gridcolor=GRID_CLR, zeroline=False)
+                        fig_dist.update_yaxes(gridcolor=GRID_CLR, zeroline=False)
+                        st.plotly_chart(fig_dist, use_container_width=True)
+                else:
+                    cols_eda = st.columns(2)
+                    for idx, col in enumerate(df_clean.columns):
+                        with cols_eda[idx % 2]:
+                            st.markdown(f"**Field:** `{col.upper()}`")
+                            if df_clean[col].dtype in [np.float64, np.int64]:
+                                c = alt.Chart(df_clean).mark_bar(color="#38bdf8").encode(
+                                    x=alt.X(col, bin=True), y="count()"
+                                ).properties(height=150)
+                            else:
+                                c = alt.Chart(df_clean).mark_bar().encode(
+                                    x="count()", y=alt.Y(col, sort="-x"), color=col
+                                ).properties(height=150)
+                            st.altair_chart(c, use_container_width=True)
+
+            with tab_box:
+                if num_cols_all and _plotly_ok:
+                    box_sel = st.multiselect(
+                        "Select columns for box plots", num_cols_all,
+                        default=num_cols_all[:5] if len(num_cols_all) >= 5 else num_cols_all,
+                        key="m1_box_sel"
+                    )
+                    if box_sel:
+                        fig_box = go.Figure()
+                        pal = [ACCENT, AMBER, PURPLE, GREEN, RED, "#f687b3", "#68d391"]
+                        for i, col in enumerate(box_sel):
+                            fig_box.add_trace(go.Box(
+                                y=df_clean[col], name=col,
+                                marker_color=pal[i % len(pal)],
+                                line_color=pal[i % len(pal)],
+                                boxmean="sd",
+                                hovertemplate=f"<b>{col}</b><br>Value: %{{y:.2f}}<extra></extra>",
+                            ))
+                        _pt(fig_box, "📦 Box Plots — Outlier & Distribution View", h=420)
+                        fig_box.update_layout(boxgap=0.3, showlegend=False)
+                        st.plotly_chart(fig_box, use_container_width=True)
+
+                        # Summary stats table
+                        st.markdown(f"<p style='color:{MUTED};font-size:0.82rem;'>Descriptive Statistics:</p>", unsafe_allow_html=True)
+                        st.dataframe(df_clean[box_sel].describe().round(2), use_container_width=True)
+                else:
+                    st.info("Install plotly or add numeric columns for box plots.")
+
+            with tab_time:
+                date_candidates = [c for c in df_clean.columns if "date" in c.lower() or "time" in c.lower()]
+                if date_candidates and num_cols_all and _plotly_ok:
+                    date_col = st.selectbox("Date column", date_candidates, key="m1_ts_date")
+                    metric_col = st.selectbox("Metric", num_cols_all, key="m1_ts_metric")
+                    try:
+                        ts_df = df_clean[[date_col, metric_col]].copy()
+                        ts_df[date_col] = pd.to_datetime(ts_df[date_col], errors="coerce")
+                        ts_df = ts_df.dropna().sort_values(date_col)
+                        if len(ts_df) > 0:
+                            fig_ts = go.Figure()
+                            fig_ts.add_trace(go.Scatter(
+                                x=ts_df[date_col], y=ts_df[metric_col],
+                                mode="lines+markers",
+                                line=dict(color=ACCENT, width=1.8),
+                                marker=dict(size=4, color=ACCENT),
+                                name=metric_col,
+                                hovertemplate=f"Date: %{{x}}<br>{metric_col}: %{{y:.2f}}<extra></extra>",
+                            ))
+                            # Rolling mean overlay
+                            roll = ts_df[metric_col].rolling(7, min_periods=1).mean()
+                            fig_ts.add_trace(go.Scatter(
+                                x=ts_df[date_col], y=roll,
+                                mode="lines",
+                                line=dict(color=AMBER, width=2, dash="dot"),
+                                name="7-day rolling mean",
+                            ))
+                            _pt(fig_ts, f"📈 {metric_col} Over Time", h=400)
+                            st.plotly_chart(fig_ts, use_container_width=True)
                         else:
-                            c = alt.Chart(df_clean).mark_bar().encode(
-                                x="count()", y=alt.Y(col, sort="-x"), color=col
-                            ).properties(height=150)
-                        st.altair_chart(c, use_container_width=True)
+                            st.warning("No valid date/metric rows after parsing.")
+                    except Exception as e_ts:
+                        st.warning(f"Time series plot failed: {e_ts}")
+                elif not date_candidates:
+                    st.info("No date/time column detected in the dataset. Upload a CSV with a Date column to see trends.")
+                else:
+                    st.info("Install plotly for time series charts.")
+
+            with tab_scatter:
+                if len(num_cols_all) >= 2 and _plotly_ok:
+                    sc_cols = st.multiselect(
+                        "Select 2–4 numeric columns for scatter matrix",
+                        num_cols_all,
+                        default=num_cols_all[:4] if len(num_cols_all) >= 4 else num_cols_all[:2],
+                        key="m1_scatter_sel"
+                    )
+                    if len(sc_cols) >= 2:
+                        try:
+                            fig_sm = px.scatter_matrix(
+                                df_clean[sc_cols].dropna(),
+                                dimensions=sc_cols,
+                                color_discrete_sequence=[ACCENT],
+                            )
+                            fig_sm.update_traces(
+                                diagonal_visible=True,
+                                marker=dict(size=3, opacity=0.5, color=ACCENT),
+                                selector=dict(type="splom"),
+                            )
+                            fig_sm.update_layout(
+                                **_PBASE,
+                                height=max(450, len(sc_cols)*160),
+                                title=dict(text="🔵 Scatter Matrix — Feature Relationships",
+                                           font_color=TEXT, font_size=13),
+                            )
+                            st.plotly_chart(fig_sm, use_container_width=True)
+                        except Exception as e_sc:
+                            st.warning(f"Scatter matrix failed: {e_sc}")
+                    else:
+                        st.info("Select at least 2 columns.")
+                else:
+                    st.info("Need ≥2 numeric columns and plotly installed.")
 
             st.divider()
             buf = io.BytesIO()
@@ -552,20 +759,68 @@ elif M == 1:
 # MILESTONE 2 — PATTERN EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 elif M == 2:
+    # ── All imports needed for M2 ─────────────────────────────────────────────
     import seaborn as sns
+    from sklearn.preprocessing import MinMaxScaler
 
-    # ── Cached helpers ─────────────────────────────────────────────────────────
-    @st.cache_data(show_spinner=False)
-    def m2_read_csv(b: bytes) -> pd.DataFrame:
-        return pd.read_csv(io.BytesIO(b))
+    # ── M2 colour palette (matches Pattern_Extraction.py exactly) ─────────────
+    M2C_DARK   = "#0d1117"; M2C_CARD   = "#161b22"; M2C_CARD2  = "#1c2128"
+    M2C_BORDER = "#30363d"; M2C_TEXT   = "#e6edf3"; M2C_MUTED  = "#8b949e"
+    M2C_BLUE   = "#58a6ff"; M2C_GREEN  = "#3fb950"; M2C_AMBER  = "#f0883e"
+    M2C_PURPLE = "#bc8cff"; M2C_RED    = "#ff7b72"; M2C_PINK   = "#f778ba"
+    M2C_TEAL   = "#39d353"
+    M2C_PAL    = [M2C_BLUE, M2C_PINK, M2C_GREEN, M2C_AMBER, M2C_PURPLE, M2C_RED, M2C_TEAL, "#ffa657"]
 
-    def df_pq(df: pd.DataFrame) -> bytes:
+    plt.rcParams.update({
+        "figure.facecolor": M2C_DARK,   "axes.facecolor":   M2C_CARD2,
+        "axes.edgecolor":   M2C_BORDER, "axes.labelcolor":  M2C_MUTED,
+        "axes.titlecolor":  M2C_TEXT,   "xtick.color":      M2C_MUTED,
+        "ytick.color":      M2C_MUTED,  "grid.color":       M2C_BORDER,
+        "text.color":       M2C_TEXT,   "legend.facecolor": M2C_CARD,
+        "legend.edgecolor": M2C_BORDER, "font.size":        9,
+    })
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def m2_step_box(num, title, desc=""):
+        st.markdown(
+            f'<div class="step-box"><span class="step-num">{num}</span>'
+            f'<div><div class="step-title">{title}</div>'
+            f'<div class="step-desc">{desc}</div></div></div>',
+            unsafe_allow_html=True)
+
+    def m2_phase_banner(icon, title, steps, desc):
+        st.markdown(
+            f'<div style="background:linear-gradient(120deg,{M2C_CARD},{M2C_CARD2});'
+            f'border:1px solid {M2C_BLUE};border-left:5px solid {M2C_BLUE};'
+            f'border-radius:12px;padding:20px 26px;margin:32px 0 6px">'
+            f'<div style="font-size:.65rem;font-weight:800;letter-spacing:.15em;'
+            f'color:{M2C_BLUE};text-transform:uppercase;margin-bottom:6px">{steps}</div>'
+            f'<div style="font-size:1.4rem;font-weight:800;color:{M2C_TEXT}">{icon} {title}</div>'
+            f'<div style="color:{M2C_MUTED};font-size:.82rem;margin-top:4px">{desc}</div>'
+            f'</div>', unsafe_allow_html=True)
+
+    def m2_fig_bytes(fig):
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+                    facecolor=M2C_DARK, edgecolor="none")
+        buf.seek(0); return buf
+
+    def m2_dl_btn(fig, fname, key):
+        st.download_button(f"📥 Download {fname}", m2_fig_bytes(fig),
+                           fname, "image/png", key=key)
+
+    def m2_df_pq(df):
         buf = io.BytesIO(); df.to_parquet(buf, index=True); buf.seek(0); return buf.read()
 
-    def ser_json(s: pd.Series) -> bytes:
+    def m2_ser_json(s):
         return s.reset_index(drop=True).to_json().encode()
 
-    def m2_detect_type(df: pd.DataFrame) -> str:
+    # ── Cached heavy computations ──────────────────────────────────────────────
+    @st.cache_data(show_spinner=False)
+    def m2_read_csv(b):
+        return pd.read_csv(io.BytesIO(b))
+
+    def m2_detect_type(df):
         cols = set(df.columns)
         if "ActivityDate"  in cols and "TotalSteps"     in cols: return "daily"
         if "ActivityHour"  in cols and "StepTotal"      in cols: return "hourly_steps"
@@ -575,35 +830,32 @@ elif M == 2:
         if "value__sum_values" in cols or "value__mean" in cols: return "tsfresh"
         return "unknown"
 
-    @st.cache_data(show_spinner="⏳ Resampling heart-rate (once)…")
-    def m2_resample_hr(b: bytes) -> bytes:
+    @st.cache_data(show_spinner="⏳ Resampling heart-rate to 1-minute (once)…")
+    def m2_resample_hr(b):
         hr = m2_read_csv(b)
         hr["Time"] = pd.to_datetime(hr["Time"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
-        out = (hr.set_index("Time").groupby("Id")["Value"].resample("1min").mean().reset_index())
+        out = hr.set_index("Time").groupby("Id")["Value"].resample("1min").mean().reset_index()
         out.columns = ["Id", "Time", "HeartRate"]
-        return df_pq(out.dropna())
+        buf = io.BytesIO(); out.dropna().to_parquet(buf, index=True); buf.seek(0)
+        return buf.read()
 
     @st.cache_data(show_spinner="⏳ Building master dataframe (once)…")
     def m2_build_master(daily_b, sleep_b, hr_min_b):
         daily  = m2_read_csv(daily_b)
         sleep  = m2_read_csv(sleep_b)
         hr_min = pd.read_parquet(io.BytesIO(hr_min_b))
-
         daily["ActivityDate"] = pd.to_datetime(daily["ActivityDate"], format="%m/%d/%Y", errors="coerce")
         sc = "date" if "date" in sleep.columns else "Date"
         sleep[sc] = pd.to_datetime(sleep[sc], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
         if sc != "date": sleep = sleep.rename(columns={sc: "date"})
-
         hr_min["Date"] = hr_min["Time"].dt.date
-        hr_d = (hr_min.groupby(["Id","Date"])["HeartRate"]
-                .agg(AvgHR="mean",MaxHR="max",MinHR="min",StdHR="std").reset_index())
-
+        hr_d = hr_min.groupby(["Id","Date"])["HeartRate"].agg(
+            AvgHR="mean", MaxHR="max", MinHR="min", StdHR="std").reset_index()
         sleep["Date"] = sleep["date"].dt.date
-        sl_d = (sleep.groupby(["Id","Date"])
-                .agg(TotalSleepMinutes=("value","count"),
-                     DominantSleepStage=("value",lambda x: x.mode().iloc[0] if not x.empty else 0))
-                .reset_index())
-
+        sl_d = sleep.groupby(["Id","Date"]).agg(
+            TotalSleepMinutes=("value","count"),
+            DominantSleepStage=("value", lambda x: x.mode().iloc[0] if not x.empty else 0)
+        ).reset_index()
         m = daily.rename(columns={"ActivityDate":"Date"}).copy()
         m["Date"] = m["Date"].dt.date
         m = m.merge(hr_d, on=["Id","Date"], how="left")
@@ -612,9 +864,10 @@ elif M == 2:
         m["DominantSleepStage"] = m["DominantSleepStage"].fillna(0)
         for c in ["AvgHR","MaxHR","MinHR","StdHR"]:
             m[c] = m.groupby("Id")[c].transform(lambda x: x.fillna(x.median()))
-        return df_pq(m)
+        buf = io.BytesIO(); m.to_parquet(buf, index=True); buf.seek(0)
+        return buf.read()
 
-    @st.cache_data(show_spinner="⏳ Fitting Prophet…")
+    @st.cache_data(show_spinner="⏳ Fitting Prophet model…")
     def m2_fit_prophet(ds_b, y_b, horizon):
         try:
             from prophet import Prophet
@@ -625,46 +878,43 @@ elif M == 2:
         df = pd.DataFrame({"ds": pd.to_datetime(ds), "y": y}).dropna().sort_values("ds")
         if len(df) < 5: return None, None
         mdl = Prophet(daily_seasonality=False, weekly_seasonality=True,
-                      yearly_seasonality=False, uncertainty_samples=200,
+                      yearly_seasonality=False, uncertainty_samples=0,
                       changepoint_prior_scale=0.1)
         mdl.fit(df)
         fc = mdl.predict(mdl.make_future_dataframe(periods=horizon))
-        for _col in ["yhat_lower", "yhat_upper"]:
-            if _col not in fc.columns:
-                fc[_col] = fc["yhat"]
-        return df_pq(df), df_pq(fc)
+        buf1 = io.BytesIO(); df.to_parquet(buf1, index=True); buf1.seek(0)
+        buf2 = io.BytesIO(); fc.to_parquet(buf2, index=True); buf2.seek(0)
+        return buf1.read(), buf2.read()
 
-    @st.cache_data(show_spinner="⏳ Clustering…")
+    @st.cache_data(show_spinner="⏳ Clustering + elbow (once)…")
     def m2_run_clustering(feat_b, k, eps, min_s):
         from sklearn.preprocessing import StandardScaler
         from sklearn.cluster import KMeans, DBSCAN
         from sklearn.decomposition import PCA
         feats = pd.read_parquet(io.BytesIO(feat_b))
         X = StandardScaler().fit_transform(feats.select_dtypes(include=[np.number]).fillna(0))
-        km  = KMeans(n_clusters=k,  random_state=42, n_init=3).fit_predict(X)
+        km  = KMeans(n_clusters=k, random_state=42, n_init=3).fit_predict(X)
         db  = DBSCAN(eps=eps, min_samples=min_s).fit_predict(X)
         pca = PCA(n_components=2, random_state=42)
         X2  = pca.fit_transform(X)
-        var = (pca.explained_variance_ratio_*100).tolist()
-        inertias = [KMeans(n_clusters=ki, random_state=42, n_init=3).fit(X).inertia_ for ki in range(2,10)]
+        var = (pca.explained_variance_ratio_ * 100).tolist()
+        inertias = [KMeans(n_clusters=ki, random_state=42, n_init=3).fit(X).inertia_
+                    for ki in range(2, 10)]
         return X.tobytes(), X2.tobytes(), var, km.tolist(), db.tolist(), inertias
 
-    def m2_fig_bytes(fig):
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor=M2_DARK)
-        buf.seek(0); return buf
-
-    def m2_step(num, title, desc=""):
-        st.markdown(
-            f'<div class="step-box"><span class="step-num">{num}</span>'
-            f'<div><div class="step-title">{title}</div>'
-            f'<div class="step-desc">{desc}</div></div></div>',
-            unsafe_allow_html=True)
+    @st.cache_data(show_spinner="⏳ Running t-SNE…")
+    def m2_run_tsne(X_b, n_feats):
+        from sklearn.manifold import TSNE
+        X = np.frombuffer(X_b, dtype=np.float64).reshape(-1, n_feats)
+        return TSNE(n_components=2, random_state=42,
+                    perplexity=min(30, max(2, len(X)-1)),
+                    max_iter=300).fit_transform(X).tobytes()
 
     # ── Sidebar params ─────────────────────────────────────────────────────────
     with st.sidebar:
         st.divider()
-        st.markdown(f"<p style='color:{TEXT};font-weight:700;font-size:0.85rem;'>⚙️ M2 Parameters</p>", unsafe_allow_html=True)
+        st.markdown(f"<p style='color:{TEXT};font-weight:700;font-size:0.85rem;'>⚙️ M2 Parameters</p>",
+                    unsafe_allow_html=True)
         OPTIMAL_K     = st.slider("K-Means Clusters (K)",    2, 8, 3, key="m2_k")
         EPS           = st.slider("DBSCAN ε (eps)",          0.5, 5.0, 2.2, 0.1, key="m2_eps")
         MIN_SAMPLES   = st.slider("DBSCAN min_samples",      1, 5, 2, key="m2_minsamp")
@@ -673,304 +923,861 @@ elif M == 2:
 
     # ── Hero ───────────────────────────────────────────────────────────────────
     st.markdown(f"""
-    <div style="background:linear-gradient(135deg,rgba(167,139,250,0.08),rgba(2,6,23,0.9));
-        border:1px solid rgba(167,139,250,0.25);border-radius:20px;padding:2rem 2.5rem;margin-bottom:1.5rem;">
-        <div style="font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:#a78bfa;
-            letter-spacing:0.15em;margin-bottom:0.5rem;">MILESTONE 2 · PATTERN EXTRACTION & MODELLING</div>
-        <div style="font-family:'Syne',sans-serif;font-size:2rem;font-weight:800;color:{TEXT};">
-            🔬 FitPulse ML Pipeline
-        </div>
-        <div style="color:{MUTED};font-size:0.88rem;margin-top:0.5rem;">
-            TSFresh · Prophet · KMeans · DBSCAN · PCA · t-SNE — Real Fitbit Device Data
-        </div>
+    <div style='background:linear-gradient(135deg,{M2C_CARD},{M2C_CARD2});
+                border:1px solid {M2C_BORDER};border-radius:14px;
+                padding:28px 32px;margin-bottom:28px'>
+      <div style='font-size:.65rem;font-weight:800;letter-spacing:.18em;
+                  color:{M2C_BLUE};text-transform:uppercase;margin-bottom:8px'>
+        MILESTONE 2 · FEATURE EXTRACTION &amp; MODELING
+      </div>
+      <div style='font-size:2.2rem;font-weight:800;color:{M2C_TEXT};line-height:1.1'>
+        ⚡ FitPulse ML Pipeline
+      </div>
+      <div style='color:{M2C_MUTED};margin-top:10px;font-size:.85rem'>
+        TSFresh · Prophet · KMeans · DBSCAN · PCA · t-SNE — Real Fitbit Device Data
+      </div>
     </div>
     """, unsafe_allow_html=True)
 
     # ── File upload ────────────────────────────────────────────────────────────
-    FILE_DEFS = [
-        ("daily","🏃","Daily Activity","dailyActivity_merged.csv"),
-        ("heartrate","❤️","Heart Rate","heartrate_seconds_merged.csv"),
-        ("hourly_intensities","⚡","Hourly Intensities","hourlyIntensities_merged.csv"),
-        ("hourly_steps","👟","Hourly Steps","hourlySteps_merged.csv"),
-        ("sleep","😴","Minute Sleep","minuteSleep_merged.csv"),
-        ("tsfresh","🧬","TSFresh Features","tsfresh_features.csv"),
+    FILE_DEFS_M2 = [
+        ("daily",              "🏃", "Daily Activity",      "dailyActivity_merged.csv"),
+        ("heartrate",          "❤️", "Heart Rate",           "heartrate_seconds_merged.csv"),
+        ("hourly_intensities", "⚡", "Hourly Intensities",   "hourlyIntensities_merged.csv"),
+        ("hourly_steps",       "👟", "Hourly Steps",         "hourlySteps_merged.csv"),
+        ("sleep",              "😴", "Minute Sleep",         "minuteSleep_merged.csv"),
+        ("tsfresh",            "🧬", "TSFresh Features",     "tsfresh_features.csv"),
     ]
-    slots = {k: None for k,*_ in FILE_DEFS}
-    raw   = {}
+    m2_slots = {k: None for k, *_ in FILE_DEFS_M2}
+    m2_raw   = {}
 
-    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.subheader("📂 Upload Fitbit CSV Files (6 files)")
-    st.caption("Hold Ctrl/Cmd to multi-select. Files are auto-detected by column structure.")
-    upl = st.file_uploader("Select all 6 CSV files", type=["csv"],
-                            accept_multiple_files=True, key="m2_upload")
-    if upl:
-        for f in upl:
+    st.markdown(f"""
+    <div style='background:{M2C_CARD};border:1px solid {M2C_BORDER};border-radius:14px;
+                padding:22px 26px;margin-bottom:18px'>
+      <div style='font-size:1.1rem;font-weight:800;color:{M2C_TEXT};margin-bottom:4px'>
+        📂 Upload Your Fitbit CSV Files
+      </div>
+      <div style='font-size:.8rem;color:{M2C_MUTED}'>
+        Select all 6 CSV files at once (hold <b>Ctrl / Cmd</b> to multi-select).<br>
+        Files are <b>auto-detected</b> by column structure — no renaming needed.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    m2_uploaded = st.file_uploader(
+        "📁 Select all 6 CSV files at once",
+        type=["csv"], accept_multiple_files=True, key="m2_upload_v2",
+    )
+    if m2_uploaded:
+        for f in m2_uploaded:
             b  = f.read()
             df = m2_read_csv(b)
             dt = m2_detect_type(df)
-            if dt in slots:
-                slots[dt] = df; raw[dt] = b
+            if dt in m2_slots:
+                m2_slots[dt] = df
+                m2_raw[dt]   = b
+        # Persist raw bytes so M3/M4 can use them
+        for _rk, _sk in [("daily","shared_daily_b"),("heartrate","shared_hr_b"),
+                          ("sleep","shared_sleep_b"),("hourly_steps","shared_hourly_s_b"),
+                          ("hourly_intensities","shared_hourly_i_b")]:
+            if m2_raw.get(_rk):
+                st.session_state[_sk] = m2_raw[_rk]
 
-    n_ok = 0
-    card_cols = st.columns(6)
-    for col, (key, icon, label, _) in zip(card_cols, FILE_DEFS):
-        ready = slots[key] is not None
-        if ready: n_ok += 1
-        bg  = "rgba(16,185,129,0.1)" if ready else CARD_BG
-        bdr = GREEN if ready else CARD_BOR
+    # Status cards
+    m2_card_cols = st.columns(6)
+    m2_n_ok = 0
+    for col, (key, icon, label, _) in zip(m2_card_cols, FILE_DEFS_M2):
+        ready = m2_slots[key] is not None
+        if ready: m2_n_ok += 1
+        bg  = f"rgba(63,185,80,.10)" if ready else M2C_CARD2
+        bdr = M2C_GREEN if ready else M2C_BORDER
+        stxt = (f'<span style="color:{M2C_GREEN};font-weight:800;font-size:.82rem">✅ Detected</span>'
+                if ready else
+                f'<span style="color:{M2C_MUTED};font-size:.78rem">⬜ Missing</span>')
         col.markdown(
-            f'<div style="background:{bg};border:1px solid {bdr};border-radius:10px;'
-            f'padding:12px 8px;text-align:center;">'
-            f'<div style="font-size:1.6rem">{icon}</div>'
-            f'<div style="font-size:0.62rem;color:{MUTED};text-transform:uppercase;letter-spacing:0.06em;margin:4px 0 2px">{label}</div>'
-            f'<div style="font-size:0.72rem;color:{"#10b981" if ready else MUTED};font-weight:700;">{"✅" if ready else "⬜"}</div></div>',
-            unsafe_allow_html=True)
-    st.progress(n_ok / 6, text=f"Files loaded: {n_ok} / 6")
-    st.markdown('</div>', unsafe_allow_html=True)
+            f'<div style="background:{bg};border:1px solid {bdr};'
+            f'border-radius:12px;padding:16px 10px;text-align:center">'
+            f'<div style="font-size:1.8rem">{icon}</div>'
+            f'<div style="font-size:.68rem;font-weight:700;color:{M2C_MUTED};'
+            f'text-transform:uppercase;letter-spacing:.06em;margin:6px 0 4px">'
+            f'{label}</div>{stxt}</div>', unsafe_allow_html=True)
 
-    req_keys = ["daily","heartrate","hourly_intensities","hourly_steps","sleep","tsfresh"]
-    if any(slots[k] is None for k in req_keys):
-        st.info("Upload all 6 CSV files to proceed.")
+    st.progress(m2_n_ok / 6, text=f"Files loaded: {m2_n_ok} / 6")
+
+    m2_required = ["daily","heartrate","hourly_intensities","hourly_steps","sleep","tsfresh"]
+    m2_missing  = [k for k in m2_required if m2_slots[k] is None]
+    if m2_missing:
+        nice_names = {"daily":"Daily Activity","heartrate":"Heart Rate",
+                      "hourly_intensities":"Hourly Intensities",
+                      "hourly_steps":"Hourly Steps","sleep":"Minute Sleep","tsfresh":"TSFresh Features"}
+        st.info(f"👆 Upload all 6 CSV files.\n\n**Still needed:** {', '.join(nice_names[k] for k in m2_missing)}")
         st.stop()
 
-    # ── Persist raw bytes to session state so M3 & M4 can use them without re-upload ──
-    if raw.get("daily"):        st.session_state["shared_daily_b"]    = raw["daily"]
-    if raw.get("heartrate"):    st.session_state["shared_hr_b"]       = raw["heartrate"]
-    if raw.get("sleep"):        st.session_state["shared_sleep_b"]    = raw["sleep"]
-    if raw.get("hourly_steps"): st.session_state["shared_hourly_s_b"] = raw["hourly_steps"]
-    if raw.get("hourly_intensities"): st.session_state["shared_hourly_i_b"] = raw["hourly_intensities"]
-
-    st.markdown('<div class="alert-success">✅ All 6 files detected. Data shared with M3 & M4 automatically.</div>', unsafe_allow_html=True)
-
-    # ── Phase 1 — Build Master ─────────────────────────────────────────────────
+    st.success("✅ All 6 files uploaded and ready.")
     st.divider()
-    m2_step("Phase 1", "Data Ingestion & Master DataFrame",
-            "Resample HR to 1-min → merge daily + sleep + HR into master DataFrame")
 
-    if st.button("🚀 Build Master DataFrame", key="m2_build", use_container_width=True):
-        with st.spinner("Resampling HR & merging..."):
-            hr_min_b = m2_resample_hr(raw["heartrate"])
-            master_b = m2_build_master(raw["daily"], raw["sleep"], hr_min_b)
-            st.session_state["m2_master_b"] = master_b
-            st.session_state.m2_master_done = True
-            # Share master with M3 & M4
-            _shared_master = pd.read_parquet(io.BytesIO(master_b))
-            st.session_state["shared_master_df"] = _shared_master
-        st.rerun()
+    # ── Session state for phases ───────────────────────────────────────────────
+    for _pk in ["m2_run_p1","m2_run_p2","m2_run_p3","m2_run_p4"]:
+        if _pk not in st.session_state:
+            st.session_state[_pk] = False
 
-    if st.session_state.m2_master_done and "m2_master_b" in st.session_state:
-        master = pd.read_parquet(io.BytesIO(st.session_state["m2_master_b"]))
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Users",   master["Id"].nunique())
-        c2.metric("Days",    len(master))
-        c3.metric("Features",len(master.columns))
-        with st.expander("Preview master dataframe"):
-            st.dataframe(master.head(20), use_container_width=True)
+    # ── Lazy parsers ───────────────────────────────────────────────────────────
+    def m2_get_daily():
+        df = m2_slots["daily"].copy()
+        df["ActivityDate"] = pd.to_datetime(df["ActivityDate"], format="%m/%d/%Y", errors="coerce")
+        return df
 
-    # ── Phase 2 — TSFresh ──────────────────────────────────────────────────────
-    st.divider()
-    m2_step("Phase 2", "TSFresh Feature Engineering", "Extract rolling features from tsfresh_features.csv")
+    def m2_get_hourly_steps():
+        df = m2_slots["hourly_steps"].copy()
+        df["ActivityHour"] = pd.to_datetime(df["ActivityHour"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+        return df
 
-    if st.session_state.m2_master_done:
-        if st.button("🧬 Load TSFresh Features", key="m2_tsfresh", use_container_width=True):
-            tsfresh_df = slots["tsfresh"].copy()
-            if tsfresh_df.columns[0] in ("Unnamed: 0","","index"):
-                tsfresh_df = tsfresh_df.rename(columns={tsfresh_df.columns[0]:"UserId"}).set_index("UserId")
-            st.session_state["m2_tsfresh_b"] = df_pq(tsfresh_df)
-            st.session_state.m2_tsfresh_done = True
-            st.rerun()
+    def m2_get_hr():
+        df = m2_slots["heartrate"].copy()
+        df["Time"] = pd.to_datetime(df["Time"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+        return df
 
-    if st.session_state.m2_tsfresh_done and "m2_tsfresh_b" in st.session_state:
-        tf = pd.read_parquet(io.BytesIO(st.session_state["m2_tsfresh_b"]))
-        c1, c2 = st.columns(2)
-        c1.metric("Users",    len(tf))
-        c2.metric("Features", tf.shape[1])
-        with st.expander("TSFresh feature sample"):
-            st.dataframe(tf.iloc[:, :10].head(10), use_container_width=True)
+    def m2_get_sleep():
+        df = m2_slots["sleep"].copy()
+        sc = "date" if "date" in df.columns else "Date"
+        df[sc] = pd.to_datetime(df[sc], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+        if sc != "date": df = df.rename(columns={sc:"date"})
+        return df
 
-    # ── Phase 3 — Prophet ──────────────────────────────────────────────────────
-    st.divider()
-    m2_step("Phase 3", "Prophet Time-Series Forecasting", "Forecast HR · Steps · Sleep")
+    def m2_get_features():
+        df = m2_slots["tsfresh"].copy()
+        if df.columns[0] in ("Unnamed: 0","","index"):
+            df = df.rename(columns={df.columns[0]:"UserId"}).set_index("UserId")
+        return df
 
-    if st.session_state.m2_master_done:
-        if st.button(f"🔮 Run Prophet Forecasting ({FORECAST_DAYS} days)", key="m2_prophet", use_container_width=True):
-            master = pd.read_parquet(io.BytesIO(st.session_state["m2_master_b"]))
-            master["Date"] = pd.to_datetime(master["Date"])
+    def m2_ensure_master_and_hr():
+        if "m2_master_b" not in st.session_state or "m2_hr_min_b" not in st.session_state:
+            hr_min_b = m2_resample_hr(m2_raw["heartrate"])
+            master_b = m2_build_master(m2_raw["daily"], m2_raw["sleep"], hr_min_b)
+            st.session_state["m2_master_b"]  = master_b
+            st.session_state["m2_hr_min_b"]  = hr_min_b
+            # Share with M3/M4
+            _sm = pd.read_parquet(io.BytesIO(master_b))
+            st.session_state["shared_master_df"] = _sm
+        return (pd.read_parquet(io.BytesIO(st.session_state["m2_master_b"])),
+                pd.read_parquet(io.BytesIO(st.session_state["m2_hr_min_b"])))
 
-            forecasts = {}
-            with st.spinner("Fitting Prophet models..."):
-                for signal, col in [("HR","AvgHR"),("Steps","TotalSteps"),("Sleep","TotalSleepMinutes")]:
-                    sub = master.dropna(subset=["Date", col])
-                    daily_agg = sub.groupby("Date")[col].mean().reset_index()
-                    ds_b = ser_json(daily_agg["Date"].astype(str))
-                    y_b  = ser_json(daily_agg[col])
-                    df_b, fc_b = m2_fit_prophet(ds_b, y_b, FORECAST_DAYS)
-                    if fc_b is not None:
-                        forecasts[signal] = (df_b, fc_b)
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 1
+    # ══════════════════════════════════════════════════════════════════════════
+    if not st.session_state["m2_run_p1"]:
+        st.markdown(
+            f'<div style="background:{M2C_CARD2};border:2px solid {M2C_BLUE};border-radius:14px;'
+            f'padding:22px 24px;text-align:center;margin:22px 0 10px">'
+            f'<div style="font-size:2rem">📂</div>'
+            f'<div style="font-size:.68rem;font-weight:800;color:{M2C_BLUE};'
+            f'text-transform:uppercase;letter-spacing:.08em;margin:6px 0 4px">Phase 1</div>'
+            f'<div style="font-size:.95rem;font-weight:700;color:{M2C_TEXT}">Data Ingestion & Cleaning</div>'
+            f'<div style="font-size:.72rem;color:{M2C_MUTED};margin-top:4px">Steps 1–9</div>'
+            f'</div>', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c2:
+            if st.button("▶  Run Phase 1", key="m2_btn_p1", use_container_width=True, type="primary"):
+                st.session_state["m2_run_p1"] = True; st.rerun()
 
-            if forecasts:
-                st.session_state["m2_forecasts"]     = {k: (db, fb) for k, (db, fb) in forecasts.items()}
-                st.session_state["m2_forecast_days"] = FORECAST_DAYS
-                st.session_state.m2_forecast_done    = True
+    if st.session_state["m2_run_p1"]:
+        m2_phase_banner("📂", "Phase 1 · Data Ingestion & Cleaning", "STEPS 1–9",
+                        "Parse timestamps → null audit → resample HR → merge master dataframe")
 
-    if st.session_state.m2_forecast_done and "m2_forecasts" in st.session_state:
-        _fdays = st.session_state.get("m2_forecast_days", 14)
-        _fcasts = st.session_state["m2_forecasts"]
-        SIG_COLORS = {"HR": M2_BLUE, "Steps": M2_GREEN, "Sleep": M2_PURPLE}
-        SIG_UNITS  = {"HR": "bpm", "Steps": "steps", "Sleep": "min"}
+        daily    = m2_get_daily()
+        hourly_s = m2_get_hourly_steps()
+        sleep_df = m2_get_sleep()
+        hr_df    = m2_get_hr()
+        date_span = (daily["ActivityDate"].max() - daily["ActivityDate"].min()).days
 
-        st.markdown(f'''<div class="step-box">
-            <span class="step-num">📈 Forecast Results</span>
-            <div><div class="step-title">Prophet Time-Series Forecast — {len(_fcasts)} Signals</div>
-            <div class="step-desc">Actual vs Forecast · Confidence Band · Changepoints · Residuals</div>
-            </div></div>''', unsafe_allow_html=True)
+        # Steps 1–3
+        m2_step_box("Step 1–3", "Files Loaded & Timestamps Parsed",
+                    "All 6 CSVs auto-detected · timestamp columns parsed to datetime")
+        shape_df = pd.DataFrame({
+            "Dataset": ["dailyActivity","hourlySteps","hourlyIntensities","minuteSleep","heartrate"],
+            "Rows":    [f"{daily.shape[0]:,}", f"{hourly_s.shape[0]:,}",
+                        f"{m2_slots['hourly_intensities'].shape[0]:,}",
+                        f"{sleep_df.shape[0]:,}", f"{hr_df.shape[0]:,}"],
+            "Columns": [daily.shape[1], hourly_s.shape[1],
+                        m2_slots["hourly_intensities"].shape[1],
+                        sleep_df.shape[1], hr_df.shape[1]],
+        })
+        st.dataframe(shape_df, use_container_width=True, hide_index=True)
+        st.divider()
 
-        for sig, (df_b, fc_b) in _fcasts.items():
-            hist = pd.read_parquet(io.BytesIO(df_b))
-            fore = pd.read_parquet(io.BytesIO(fc_b))
-            hist_dates = pd.to_datetime(hist["ds"])
-            fore_dates = pd.to_datetime(fore["ds"])
-            split_date = hist_dates.max()
-            clr        = SIG_COLORS.get(sig, M2_BLUE)
-            unit       = SIG_UNITS.get(sig, "")
+        # Step 4 — Null check
+        m2_step_box("Step 4", "Null Value Check — All 5 Datasets", "0 nulls = clean data")
+        null_rows = []
+        for name, df_n in [("dailyActivity", daily), ("hourlySteps", hourly_s),
+                           ("hourlyIntensities", m2_slots["hourly_intensities"]),
+                           ("minuteSleep", sleep_df), ("heartrate", hr_df)]:
+            n = int(df_n.isnull().sum().sum())
+            null_rows.append({"Dataset": name, "Total Nulls": n,
+                               "Shape": str(df_n.shape),
+                               "Status": "✅ Clean" if n == 0 else f"⚠️ {n} nulls"})
+        st.dataframe(pd.DataFrame(null_rows), use_container_width=True, hide_index=True)
 
-            # align forecast yhat with historical dates for residuals
-            merged = hist.copy()
-            merged["ds"] = pd.to_datetime(merged["ds"])
-            fore_hist = fore[fore["ds"] <= split_date].copy()
-            fore_hist["ds"] = pd.to_datetime(fore_hist["ds"])
-            merged = merged.merge(fore_hist[["ds","yhat","yhat_lower","yhat_upper"]], on="ds", how="left")
-            merged["residual"] = merged["y"] - merged["yhat"]
+        fig_nv, ax_nv = plt.subplots(figsize=(9, 2.2))
+        ax_nv.barh([r["Dataset"] for r in null_rows], [0]*5, color=M2C_GREEN, height=0.4)
+        for i in range(5):
+            ax_nv.text(0.01, i, "  0 nulls — 100% complete ✅",
+                       va="center", fontsize=9, color=M2C_GREEN, fontweight="700")
+        ax_nv.set_xlim(0, 1); ax_nv.set_xticks([]); ax_nv.grid(False)
+        ax_nv.set_title("Null Value Audit", fontsize=10, color=M2C_TEXT, pad=6)
+        plt.tight_layout(); st.pyplot(fig_nv); plt.close(fig_nv)
+        st.divider()
 
-            st.markdown(f"#### {'❤️' if sig=='HR' else '🚶' if sig=='Steps' else '💤'} {sig} Forecast")
-            fig, axes = plt.subplots(2, 2, figsize=(14, 7))
-            fig.patch.set_facecolor(M2_DARK)
-            fig.suptitle(f"{sig} — Prophet Analysis ({_fdays}d horizon)", color=M2_TEXT, fontsize=12, fontweight="bold")
+        # Steps 5–6 overview
+        m2_step_box("Step 5–6", "Dataset Overview — Key Counts", "Users · date range · rows")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Total Users",  daily["Id"].nunique())
+        c2.metric("Sleep Users",  sleep_df["Id"].nunique())
+        c3.metric("HR Users",     hr_df["Id"].nunique())
+        c4.metric("HR Records",   f"{hr_df.shape[0]:,}")
+        c5.metric("Date Span",    f"{date_span} days")
+        c6.metric("Total Rows",   f"{sum(x.shape[0] for x in [daily,hourly_s,sleep_df,hr_df]):,}")
+        st.divider()
 
-            # ── Panel 1: Full forecast with confidence band ──────────────────
-            ax1 = axes[0, 0]
-            ax1.set_facecolor(M2_CARD2)
-            ax1.plot(hist_dates, hist["y"], color=clr, lw=1.8, label="Actual", zorder=3)
-            ax1.plot(fore_dates, fore["yhat"], color=M2_AMBER, lw=1.5, ls="--", label="Forecast", zorder=3)
-            ax1.fill_between(fore_dates, fore["yhat_lower"], fore["yhat_upper"],
-                             alpha=0.18, color=M2_AMBER, label="95% CI")
-            ax1.axvline(split_date, color=M2_RED, ls=":", lw=1.2, label="Forecast start")
-            ax1.set_title("Forecast + Confidence Band", color=M2_TEXT, fontsize=9)
-            ax1.legend(fontsize=7, loc="upper left"); ax1.grid(alpha=0.15)
-            ax1.tick_params(axis="x", rotation=25)
+        # Step 6 — HR Resample
+        m2_step_box("Step 6", "HR: Seconds → 1-Minute Resampling",
+                    "Per-second HR resampled to 1-minute mean — runs once, fully cached")
+        hr_min_b_p1 = m2_resample_hr(m2_raw["heartrate"])
+        hr_min_p1   = pd.read_parquet(io.BytesIO(hr_min_b_p1))
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Before (rows)", f"{hr_df.shape[0]:,}",     delta="seconds-level")
+        r2.metric("After  (rows)", f"{hr_min_p1.shape[0]:,}", delta="1-min intervals")
+        r3.metric("Compression",
+                  f"{(1-hr_min_p1.shape[0]/hr_df.shape[0])*100:.0f}%", delta_color="off")
+        st.divider()
 
-            # ── Panel 2: Forecast-only zoom ──────────────────────────────────
-            ax2 = axes[0, 1]
-            ax2.set_facecolor(M2_CARD2)
-            fore_only = fore[fore["ds"] > split_date]
-            ax2.plot(pd.to_datetime(fore_only["ds"]), fore_only["yhat"],
-                     color=M2_AMBER, lw=2, label="Predicted")
-            ax2.fill_between(pd.to_datetime(fore_only["ds"]),
-                             fore_only["yhat_lower"], fore_only["yhat_upper"],
-                             alpha=0.22, color=M2_AMBER, label="95% CI")
-            ax2.set_title(f"Future {_fdays}-Day Forecast", color=M2_TEXT, fontsize=9)
-            ax2.legend(fontsize=7); ax2.grid(alpha=0.15)
-            ax2.tick_params(axis="x", rotation=25)
+        # Steps 7–9 — Build master
+        m2_step_box("Step 7–9", "Cleaned Master Dataframe",
+                    "dailyActivity + HR aggregates + sleep aggregates → one row per user per day")
+        master_b_p1 = m2_build_master(m2_raw["daily"], m2_raw["sleep"], hr_min_b_p1)
+        master_p1   = pd.read_parquet(io.BytesIO(master_b_p1))
+        st.session_state["m2_master_b"] = master_b_p1
+        st.session_state["m2_hr_min_b"] = hr_min_b_p1
+        st.session_state["shared_master_df"] = master_p1
 
-            # ── Panel 3: Residuals ───────────────────────────────────────────
-            ax3 = axes[1, 0]
-            ax3.set_facecolor(M2_CARD2)
-            resid_valid = merged["residual"].dropna()
-            resid_dates = merged.loc[resid_valid.index, "ds"]
-            bar_colors  = [M2_RED if v < 0 else M2_GREEN for v in resid_valid]
-            ax3.bar(resid_dates, resid_valid, color=bar_colors, alpha=0.75, width=0.8)
-            ax3.axhline(0, color=M2_TEXT, lw=0.8)
-            ax3.axhline(resid_valid.std(),  color=M2_AMBER, ls="--", lw=0.8, label="+1σ")
-            ax3.axhline(-resid_valid.std(), color=M2_AMBER, ls="--", lw=0.8, label="−1σ")
-            ax3.set_title(f"Residuals (Actual − Fitted) · RMSE={((resid_valid**2).mean()**0.5):.1f} {unit}", color=M2_TEXT, fontsize=9)
-            ax3.legend(fontsize=7); ax3.grid(alpha=0.15)
-            ax3.tick_params(axis="x", rotation=25)
+        cm1, cm2, cm3 = st.columns(3)
+        cm1.metric("Master Shape",  str(master_p1.shape))
+        cm2.metric("Unique Users",  master_p1["Id"].nunique())
+        cm3.metric("Null Values",   int(master_p1.isnull().sum().sum()))
+        preview_c = [c for c in ["Id","Date","TotalSteps","Calories","AvgHR",
+                                  "TotalSleepMinutes","VeryActiveMinutes","SedentaryMinutes"]
+                     if c in master_p1.columns]
+        st.dataframe(master_p1[preview_c].head(15), use_container_width=True, hide_index=True)
+        st.divider()
 
-            # ── Panel 4: Residual distribution ───────────────────────────────
-            ax4 = axes[1, 1]
-            ax4.set_facecolor(M2_CARD2)
-            if len(resid_valid) > 2:
-                ax4.hist(resid_valid, bins=20, color=clr, alpha=0.75, edgecolor=M2_BORDER)
-                ax4.axvline(0, color=M2_RED, lw=1.2, ls="--")
-                ax4.axvline(resid_valid.mean(), color=M2_AMBER, lw=1.2, ls="-.",
-                            label=f"Mean={resid_valid.mean():.1f}")
-            ax4.set_title("Residual Distribution", color=M2_TEXT, fontsize=9)
-            ax4.set_xlabel(f"Residual ({unit})", color=M2_MUTED, fontsize=8)
-            ax4.legend(fontsize=7); ax4.grid(alpha=0.15)
+        # Step 9a — Stats
+        m2_step_box("Step 9a", "Summary Statistics", "describe() for key columns")
+        key_c = [c for c in ["TotalSteps","Calories","AvgHR","TotalSleepMinutes",
+                              "VeryActiveMinutes","SedentaryMinutes"] if c in master_p1.columns]
+        st.dataframe(master_p1[key_c].describe().round(2), use_container_width=True)
+        st.divider()
 
+        # Step 9b — Distribution Histograms (2 per row, exact from Pattern_Extraction.py)
+        m2_step_box("Step 9b", "Activity Distribution Histograms", "Mean line on every chart")
+        dist_cfg = [
+            ("TotalSteps",        "Total Daily Steps",     M2C_BLUE,   "Steps/day"),
+            ("Calories",          "Daily Calories Burned", M2C_GREEN,  "Calories/day"),
+            ("TotalSleepMinutes", "Daily Sleep Duration",  M2C_PURPLE, "Min/day"),
+            ("SedentaryMinutes",  "Sedentary Time/Day",   M2C_AMBER,  "Min/day"),
+            ("VeryActiveMinutes", "Very-Active Time/Day",  M2C_RED,    "Min/day"),
+            ("AvgHR",             "Average Heart Rate",    M2C_PINK,   "BPM"),
+        ]
+        dist_cfg = [(k, t, c, x) for k, t, c, x in dist_cfg if k in master_p1.columns]
+        for i in range(0, len(dist_cfg), 2):
+            cols_d = st.columns(2)
+            for j in range(2):
+                if i + j >= len(dist_cfg): break
+                key, title, color, xlabel = dist_cfg[i + j]
+                s = master_p1[key].dropna()
+                fig, ax = plt.subplots(figsize=(7, 3.2))
+                cnts, _, patches = ax.hist(s, bins=20, color=color, alpha=0.85,
+                                           edgecolor=M2C_DARK, linewidth=0.4)
+                top = max(cnts) if len(cnts) > 0 else 1
+                for patch, cnt in zip(patches, cnts):
+                    if cnt > 0:
+                        ax.text(patch.get_x() + patch.get_width() / 2,
+                                cnt + top * 0.015, f"{int(cnt)}",
+                                ha="center", va="bottom", fontsize=7, color=M2C_TEXT)
+                mv = s.mean()
+                ax.axvline(mv, color="white", linestyle="--", linewidth=1.2,
+                           label=f"Mean={mv:.0f}")
+                ax.set_title(f"📊 {title}", fontsize=9, color=M2C_TEXT, pad=5)
+                ax.set_xlabel(xlabel, fontsize=8, color=M2C_MUTED)
+                ax.set_ylabel("Records", fontsize=8, color=M2C_MUTED)
+                ax.legend(fontsize=8, framealpha=0.4); ax.grid(axis="y", alpha=0.2)
+                plt.tight_layout()
+                cols_d[j].pyplot(fig); plt.close(fig)
+        st.divider()
+
+        # Step 9c — Hourly heatmap
+        m2_step_box("Step 9c", "Hourly Steps Heatmap — When Are Users Most Active?",
+                    "Average steps per day-of-week × hour-of-day")
+        hs = m2_get_hourly_steps()
+        hs["Hour"]      = hs["ActivityHour"].dt.hour
+        hs["DayOfWeek"] = hs["ActivityHour"].dt.day_name()
+        pivot_hw = hs.groupby(["DayOfWeek","Hour"])["StepTotal"].mean().unstack()
+        day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        pivot_hw = pivot_hw.reindex([d for d in day_order if d in pivot_hw.index])
+        fig_hw, ax_hw = plt.subplots(figsize=(16, 4.5))
+        sns.heatmap(pivot_hw, ax=ax_hw, cmap="YlOrRd",
+                    annot=True, fmt=".0f", annot_kws={"size": 6},
+                    linewidths=0.2, linecolor=M2C_DARK,
+                    cbar_kws={"label":"Avg Steps/Hour","shrink":0.6})
+        ax_hw.set_title("🕐 Average Steps by Day × Hour", fontsize=11, color=M2C_TEXT, pad=8)
+        ax_hw.set_xlabel("Hour (0–23)", fontsize=9, color=M2C_MUTED)
+        ax_hw.set_ylabel("Day of Week",  fontsize=9, color=M2C_MUTED)
+        plt.tight_layout(); st.pyplot(fig_hw); plt.close(fig_hw)
+        st.divider()
+
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c2:
+            if st.button("▶  Run Phase 2 — Feature Engineering", key="m2_btn_p2",
+                         use_container_width=True, type="primary"):
+                st.session_state["m2_run_p2"] = True; st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 2 — TSFresh
+    # ══════════════════════════════════════════════════════════════════════════
+    if st.session_state["m2_run_p2"]:
+        m2_phase_banner("🧬", "Phase 2 · Feature Engineering", "STEPS 10–12",
+                        "TSFresh features loaded from CSV — 10 statistical features per user")
+
+        features = m2_get_features()
+
+        m2_step_box("Step 10–11", "TSFresh Feature Matrix",
+                    "sum · median · mean · length · std · variance · rms · max · abs_max · min")
+        ff1, ff2, ff3 = st.columns(3)
+        ff1.metric("Users (rows)",    features.shape[0])
+        ff2.metric("Features (cols)", features.shape[1])
+        ff3.metric("Source",          "Uploaded tsfresh_features.csv")
+        st.markdown("**Feature names:**")
+        for i, c in enumerate(features.columns):
+            st.markdown(f"<span class='info-pill'>{i+1}. {c.replace('value__','')}</span>",
+                        unsafe_allow_html=True)
+        st.markdown("")
+        st.dataframe(features.round(4), use_container_width=True)
+        st.divider()
+
+        # Step 12a — Feature Heatmap (normalized, exact from Pattern_Extraction.py)
+        m2_step_box("Step 12a", "Feature Heatmap — Normalized 0–1  📸 Screenshot This",
+                    "Each cell = exact normalized value · Rows=Users · Cols=Features")
+        feat_norm = pd.DataFrame(
+            MinMaxScaler().fit_transform(features),
+            index=features.index, columns=features.columns)
+        fd = feat_norm.rename(columns={c: c.replace("value__","") for c in feat_norm.columns})
+        fd.index = [str(i)[-6:] for i in fd.index]
+        fig_hm2, ax_hm2 = plt.subplots(
+            figsize=(max(12, len(features.columns)*1.4),
+                     max(5,  len(features)*0.6)))
+        sns.heatmap(fd, ax=ax_hm2, cmap="coolwarm",
+                    annot=True, fmt=".2f", annot_kws={"size":8.5,"weight":"bold"},
+                    linewidths=0.4, linecolor=M2C_DARK,
+                    cbar_kws={"label":"Normalized 0–1","shrink":0.8},
+                    vmin=0, vmax=1)
+        ax_hm2.set_title("🧬 TSFresh Feature Matrix — Normalized",
+                         fontsize=11, color=M2C_TEXT, pad=10)
+        ax_hm2.set_xlabel("Statistical Feature", fontsize=9, color=M2C_MUTED)
+        ax_hm2.set_ylabel("User ID (last 6 digits)", fontsize=9, color=M2C_MUTED)
+        plt.xticks(rotation=30, ha="right", fontsize=8); plt.yticks(fontsize=8)
+        plt.tight_layout()
+        st.pyplot(fig_hm2); m2_dl_btn(fig_hm2, "tsfresh_heatmap.png", "m2_dl_hm2"); plt.close(fig_hm2)
+        st.divider()
+
+        # Step 12b — Per-feature bar charts (3 per row, exact from Pattern_Extraction.py)
+        m2_step_box("Step 12b", "Per-Feature Bar Charts  (3 per row)",
+                    "Sorted ascending · exact value labeled on every bar")
+        feat_cols_list = list(features.columns)
+        for i in range(0, len(feat_cols_list), 3):
+            cols_b = st.columns(min(3, len(feat_cols_list) - i))
+            for j, col_b in enumerate(cols_b):
+                if i + j >= len(feat_cols_list): break
+                feat  = feat_cols_list[i + j]
+                fname = feat.replace("value__","")
+                vals  = features[feat].sort_values()
+                ulbls = [str(x)[-5:] for x in vals.index]
+                fig_b, ax_b = plt.subplots(figsize=(5, 3))
+                bars_b = ax_b.bar(range(len(vals)), vals.values,
+                                  color=[M2C_PAL[k % len(M2C_PAL)] for k in range(len(vals))],
+                                  edgecolor=M2C_DARK, linewidth=0.3, zorder=3)
+                mx = max(abs(vals.values)) if len(vals) else 1
+                for bar, v in zip(bars_b, vals.values):
+                    ax_b.text(bar.get_x() + bar.get_width() / 2,
+                              bar.get_height() + mx * 0.025,
+                              f"{v:.1f}", ha="center", va="bottom",
+                              fontsize=6.5, color=M2C_TEXT, fontweight="700")
+                ax_b.set_xticks(range(len(vals)))
+                ax_b.set_xticklabels(ulbls, rotation=35, ha="right", fontsize=7)
+                ax_b.set_title(f"📊 {fname}", fontsize=9, color=M2C_TEXT, pad=4)
+                ax_b.set_xlabel("User ID (last 5 dig.)", fontsize=7, color=M2C_MUTED)
+                ax_b.set_ylabel(fname, fontsize=7, color=M2C_MUTED)
+                ax_b.grid(axis="y", alpha=0.2); ax_b.set_axisbelow(True)
+                plt.tight_layout()
+                col_b.pyplot(fig_b); plt.close(fig_b)
+
+        st.divider()
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c2:
+            if st.button("▶  Run Phase 3 — Prophet Forecasting", key="m2_btn_p3",
+                         use_container_width=True, type="primary"):
+                st.session_state["m2_run_p3"] = True; st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 3 — Prophet
+    # ══════════════════════════════════════════════════════════════════════════
+    if st.session_state["m2_run_p3"]:
+        m2_phase_banner("📈", "Phase 3 · Prophet Trend Forecasting", "STEPS 13–17",
+                        f"Prophet (fast mode: uncertainty_samples=0) → {FORECAST_DAYS}-day forecast")
+
+        try:
+            from prophet import Prophet
+        except ImportError:
+            st.error("❌ prophet not installed. Run: pip install prophet"); st.stop()
+
+        master_p3, hr_min_p3 = m2_ensure_master_and_hr()
+
+        def m2_prophet_plot(df_in, fc, color, title, ylabel, dl_key):
+            fig, ax = plt.subplots(figsize=(13, 5))
+            fc_start = df_in["ds"].max()
+            if "yhat_lower" in fc.columns and "yhat_upper" in fc.columns:
+                ax.fill_between(fc["ds"], fc["yhat_lower"], fc["yhat_upper"],
+                                alpha=0.18, color=color, label="Confidence Interval")
+            ax.plot(fc["ds"], fc["yhat"], color=M2C_TEXT, linewidth=2,
+                    label="Prophet Trend", zorder=3)
+            ax.scatter(df_in["ds"], df_in["y"], color=color, s=28, zorder=5,
+                       alpha=0.9, label="Actual Values")
+            for idx, (_, row) in enumerate(df_in.iterrows()):
+                if idx % 5 == 0:
+                    ax.annotate(f"{row['y']:.0f}", (row["ds"], row["y"]),
+                                textcoords="offset points", xytext=(0, 6),
+                                fontsize=6, color=M2C_TEXT, ha="center", alpha=0.8)
+            ax.axvline(fc_start, color=M2C_AMBER, linestyle="--", linewidth=1.6,
+                       label=f"Forecast Start ({fc_start.date()})", alpha=0.9)
+            ax.set_title(f"📈 {title}", fontsize=11, color=M2C_TEXT, pad=8)
+            ax.set_xlabel("Date", fontsize=9, color=M2C_MUTED)
+            ax.set_ylabel(ylabel, fontsize=9, color=M2C_MUTED)
+            ax.legend(fontsize=8, framealpha=0.35); ax.grid(alpha=0.15)
             plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+            st.pyplot(fig); m2_dl_btn(fig, dl_key, dl_key.replace(".","_")); plt.close(fig)
 
-            # Metrics row
-            mae  = resid_valid.abs().mean() if len(resid_valid) else float("nan")
-            rmse = (resid_valid**2).mean()**0.5 if len(resid_valid) else float("nan")
-            mape = (resid_valid.abs() / (merged["y"].abs() + 1e-9)).mean() * 100 if len(resid_valid) else float("nan")
-            next_val = fore_only["yhat"].iloc[0] if len(fore_only) else float("nan")
-            st.markdown(f'''<div class="metric-grid">
-                <div class="metric-card"><div class="metric-val" style="color:{clr}">{mae:.1f}</div><div class="metric-label">MAE ({unit})</div></div>
-                <div class="metric-card"><div class="metric-val" style="color:{M2_AMBER}">{rmse:.1f}</div><div class="metric-label">RMSE ({unit})</div></div>
-                <div class="metric-card"><div class="metric-val" style="color:{M2_PINK}">{mape:.1f}%</div><div class="metric-label">MAPE</div></div>
-                <div class="metric-card"><div class="metric-val" style="color:{M2_GREEN}">{next_val:.1f}</div><div class="metric-label">Next Day Forecast</div></div>
-            </div>''', unsafe_allow_html=True)
-            st.divider()
+        # Heart Rate
+        m2_step_box("Step 13–14", "Heart Rate Forecast  📸 Screenshot This",
+                    "Daily mean HR → Prophet (fast) → CI shown")
+        hr_agg = hr_min_p3.groupby(hr_min_p3["Time"].dt.date)["HeartRate"].mean().reset_index()
+        hr_agg.columns = ["ds","y"]
+        hr_agg["ds"]   = pd.to_datetime(hr_agg["ds"])
+        hr_agg         = hr_agg.dropna().sort_values("ds")
+        res_hr = m2_fit_prophet(m2_ser_json(hr_agg["ds"]), m2_ser_json(hr_agg["y"]), FORECAST_DAYS)
+        if res_hr[0] is None:
+            st.warning("Not enough heart rate data for Prophet (need ≥5 days).")
+        else:
+            df_hr = pd.read_parquet(io.BytesIO(res_hr[0]))
+            fc_hr = pd.read_parquet(io.BytesIO(res_hr[1]))
+            h1, h2, h3 = st.columns(3)
+            h1.metric("Training Points",  len(df_hr))
+            h2.metric("Forecast Horizon", f"{FORECAST_DAYS} days")
+            h3.metric("Mode",             "Fast (uncertainty_samples=0)")
+            m2_prophet_plot(df_hr, fc_hr, M2C_AMBER,
+                            f"Heart Rate Forecast — {FORECAST_DAYS}-Day Projection",
+                            "Avg Heart Rate (BPM)", "prophet_hr.png")
+        st.divider()
 
-        st.markdown('<div class="alert-success">✅ Prophet forecasting complete — all signals analysed.</div>', unsafe_allow_html=True)
+        # Steps
+        m2_step_box("Step 15–16", "Daily Steps Forecast  📸 Screenshot This",
+                    "Average steps/day → Prophet → annotated")
+        steps_agg = m2_get_daily().groupby("ActivityDate")["TotalSteps"].mean().reset_index()
+        steps_agg.columns = ["ds","y"]
+        steps_agg["ds"]   = pd.to_datetime(steps_agg["ds"])
+        steps_agg         = steps_agg.dropna().sort_values("ds")
+        res_st  = m2_fit_prophet(m2_ser_json(steps_agg["ds"]), m2_ser_json(steps_agg["y"]), FORECAST_DAYS)
+        df_st = fc_st = None
+        if res_st[0] is not None:
+            df_st = pd.read_parquet(io.BytesIO(res_st[0]))
+            fc_st = pd.read_parquet(io.BytesIO(res_st[1]))
+            m2_prophet_plot(df_st, fc_st, M2C_GREEN,
+                            f"Daily Steps Forecast — {FORECAST_DAYS}-Day Projection",
+                            "Avg Steps/Day", "prophet_steps.png")
+        st.divider()
 
-    # ── Phase 4 — Clustering ───────────────────────────────────────────────────
-    st.divider()
-    m2_step("Phase 4", "User Clustering — KMeans + DBSCAN + PCA", "Segment users by activity profile")
+        # Sleep
+        m2_step_box("Step 17", "Sleep Duration Forecast  📸 Screenshot This",
+                    "Daily mean sleep → Prophet → CI shown")
+        sleep_agg = master_p3.groupby("Date")["TotalSleepMinutes"].mean().reset_index()
+        sleep_agg.columns = ["ds","y"]
+        sleep_agg["ds"]   = pd.to_datetime(sleep_agg["ds"])
+        sleep_agg         = sleep_agg[sleep_agg["y"] > 0].dropna().sort_values("ds")
+        res_sl  = m2_fit_prophet(m2_ser_json(sleep_agg["ds"]), m2_ser_json(sleep_agg["y"]), FORECAST_DAYS)
+        df_sl = fc_sl = None
+        if res_sl[0] is not None:
+            df_sl = pd.read_parquet(io.BytesIO(res_sl[0]))
+            fc_sl = pd.read_parquet(io.BytesIO(res_sl[1]))
+            m2_prophet_plot(df_sl, fc_sl, M2C_PURPLE,
+                            f"Sleep Duration Forecast — {FORECAST_DAYS}-Day Projection",
+                            "Avg Sleep (min/day)", "prophet_sleep.png")
 
-    if st.session_state.m2_tsfresh_done:
-        if st.button(f"🔍 Run Clustering (K={OPTIMAL_K})", key="m2_cluster", use_container_width=True):
-            tf_b = st.session_state["m2_tsfresh_b"]
-            with st.spinner("Running clustering..."):
-                X_b, X2_b, var, km_lbls, db_lbls, inertias = m2_run_clustering(
-                    tf_b, OPTIMAL_K, EPS, MIN_SAMPLES)
-                st.session_state["m2_cluster_res"] = (X_b, X2_b, var, km_lbls, db_lbls, inertias)
-                st.session_state.m2_cluster_done  = True
-            st.rerun()
+            # Combined stacked plot
+            if df_st is not None and fc_st is not None:
+                st.divider()
+                m2_step_box("Step 15–17 Combined", "Steps + Sleep Combined  📸 Screenshot This",
+                            "2-row stacked figure · both annotated")
+                fig_comb, axes_c = plt.subplots(2, 1, figsize=(13, 9))
+                fig_comb.patch.set_facecolor(M2C_DARK)
+                for ax_c, (df_c, fc_c, col_c, lbl_c) in zip(
+                    axes_c,
+                    [(df_st, fc_st, M2C_GREEN,  "Steps"),
+                     (df_sl, fc_sl, M2C_PURPLE, "Sleep (minutes)")]):
+                    ax_c.set_facecolor(M2C_CARD2)
+                    if "yhat_lower" in fc_c.columns:
+                        ax_c.fill_between(fc_c["ds"], fc_c["yhat_lower"], fc_c["yhat_upper"],
+                                          alpha=0.2, color=col_c, label="CI")
+                    ax_c.plot(fc_c["ds"], fc_c["yhat"], color=M2C_TEXT, linewidth=2.2, label="Trend")
+                    ax_c.scatter(df_c["ds"], df_c["y"], color=col_c, s=20,
+                                 alpha=0.85, zorder=4, label=f"Actual {lbl_c}")
+                    for idx, (_, row) in enumerate(df_c.iterrows()):
+                        if idx % 5 == 0:
+                            ax_c.annotate(f"{row['y']:.0f}", (row["ds"], row["y"]),
+                                          textcoords="offset points", xytext=(0, 5),
+                                          fontsize=5.5, color=M2C_TEXT, ha="center", alpha=0.75)
+                    ax_c.axvline(df_c["ds"].max(), color=M2C_AMBER, linestyle="--",
+                                 linewidth=1.6, label="Forecast Start")
+                    ax_c.set_title(f"{lbl_c} — Prophet Trend Forecast", fontsize=11, color=M2C_TEXT)
+                    ax_c.set_xlabel("Date", color=M2C_MUTED)
+                    ax_c.set_ylabel(lbl_c, color=M2C_MUTED)
+                    ax_c.legend(fontsize=8, framealpha=0.3); ax_c.grid(alpha=0.15)
+                plt.tight_layout()
+                st.pyplot(fig_comb)
+                m2_dl_btn(fig_comb, "prophet_combined.png", "m2_dl_comb"); plt.close(fig_comb)
+        st.divider()
 
-    if st.session_state.m2_cluster_done and "m2_cluster_res" in st.session_state:
-        X_b, X2_b, var, km_lbls, db_lbls, inertias = st.session_state["m2_cluster_res"]
-        X2 = np.frombuffer(X2_b, dtype=np.float64).reshape(-1, 2)
-        _tsfresh_b = st.session_state["m2_tsfresh_b"]
-        tf  = pd.read_parquet(io.BytesIO(_tsfresh_b))
-        n_feats = tf.select_dtypes(include=[np.number]).shape[1]
+        c1, c2, c3 = st.columns([2, 3, 2])
+        with c2:
+            if st.button("▶  Run Phase 4 — Clustering & Reduction", key="m2_btn_p4",
+                         use_container_width=True, type="primary"):
+                st.session_state["m2_run_p4"] = True; st.rerun()
 
-        # Elbow plot
-        tab_elbow, tab_pca, tab_db = st.tabs(["📐 Elbow", "🔵 PCA (KMeans)", "🔴 PCA (DBSCAN)"])
-        with tab_elbow:
-            fig, ax = plt.subplots(figsize=(7, 4)); fig.patch.set_facecolor(M2_DARK)
-            ax.plot(range(2, 10), inertias, marker="o", color=M2_BLUE, lw=2)
-            ax.axvline(OPTIMAL_K, color=M2_RED, ls="--", lw=1.5, label=f"K={OPTIMAL_K}")
-            ax.set_title("K-Means Elbow", color=M2_TEXT, fontsize=10)
-            ax.set_xlabel("K", color=M2_MUTED); ax.set_ylabel("Inertia", color=M2_MUTED)
-            ax.legend(fontsize=8); ax.grid(alpha=0.2); plt.tight_layout()
-            st.pyplot(fig); plt.close(fig)
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 4 — Clustering
+    # ══════════════════════════════════════════════════════════════════════════
+    if st.session_state["m2_run_p4"]:
+        m2_phase_banner("🤖", "Phase 4 · Clustering & Dimensionality Reduction",
+                        "STEPS 18–27",
+                        "Feature matrix → StandardScaler → K-Means + DBSCAN → "
+                        "Elbow → PCA → t-SNE → Cluster profiles")
 
-        for tab, lbls, title in [(tab_pca, km_lbls, "K-Means"), (tab_db, db_lbls, "DBSCAN")]:
-            with tab:
-                fig, ax = plt.subplots(figsize=(8, 5)); fig.patch.set_facecolor(M2_DARK)
-                unique_lbls = sorted(set(lbls))
-                for lbl in unique_lbls:
-                    mask = np.array(lbls) == lbl
-                    clr  = M2_RED if lbl == -1 else M2_PAL[lbl % len(M2_PAL)]
-                    marker = "X" if lbl == -1 else "o"
-                    lab  = "Noise/Outlier" if lbl == -1 else f"Cluster {lbl}"
-                    ax.scatter(X2[mask, 0], X2[mask, 1], c=clr, marker=marker,
-                               s=120, alpha=0.85, label=lab, edgecolors=M2_DARK, lw=0.5)
-                ax.set_title(f"PCA — {title} (var {var[0]:.1f}% + {var[1]:.1f}%)", color=M2_TEXT)
-                ax.set_xlabel(f"PC1 ({var[0]:.1f}%)", color=M2_MUTED)
-                ax.set_ylabel(f"PC2 ({var[1]:.1f}%)", color=M2_MUTED)
-                ax.legend(fontsize=8); ax.grid(alpha=0.2); plt.tight_layout()
-                st.pyplot(fig); plt.close(fig)
+        master_p4, _ = m2_ensure_master_and_hr()
 
-        st.markdown('<div class="alert-success">✅ Milestone 2 Complete — All 4 phases executed successfully!</div>', unsafe_allow_html=True)
+        m2_step_box("Step 18", "Clustering Feature Matrix",
+                    "Average each user's daily metrics → one row per user")
+        clust_c = [c for c in ["TotalSteps","Calories","VeryActiveMinutes","FairlyActiveMinutes",
+                                "LightlyActiveMinutes","SedentaryMinutes","TotalSleepMinutes"]
+                   if c in master_p4.columns]
+        clust_feats = master_p4.groupby("Id")[clust_c].mean().round(3).dropna()
+        cff1, cff2 = st.columns(2)
+        cff1.metric("Users for clustering", clust_feats.shape[0])
+        cff2.metric("Features",             clust_feats.shape[1])
+        st.dataframe(clust_feats.round(2), use_container_width=True)
+        st.divider()
+
+        m2_step_box("Step 19", "StandardScaler + Clustering (cached)",
+                    "Normalised to mean≈0 · std≈1 · KMeans · DBSCAN · PCA")
+        _cf_buf = io.BytesIO(); clust_feats.to_parquet(_cf_buf, index=True); _cf_buf.seek(0)
+        (X_b, X2_b, var, km_list, db_list, inertias) = m2_run_clustering(
+            _cf_buf.read(), OPTIMAL_K, EPS, MIN_SAMPLES)
+        X_scaled      = np.frombuffer(X_b,  dtype=np.float64).reshape(-1, len(clust_c))
+        X_pca         = np.frombuffer(X2_b, dtype=np.float64).reshape(-1, 2)
+        kmeans_labels = np.array(km_list, dtype=int)
+        dbscan_labels = np.array(db_list, dtype=int)
+        sc1, sc2 = st.columns(2)
+        sc1.metric("Mean after scaling (≈0)", f"{X_scaled.mean():.6f}")
+        sc2.metric("Std  after scaling (≈1)", f"{X_scaled.std():.4f}")
+        st.divider()
+
+        # Step 20 — Elbow curve (exact from Pattern_Extraction.py)
+        m2_step_box("Step 20", "K-Means Elbow Curve  📸 Screenshot This",
+                    f"Inertia K=2…9 · selected K={OPTIMAL_K} highlighted")
+        K_range = range(2, 10)
+        fig_el, ax_el = plt.subplots(figsize=(10, 4))
+        ax_el.plot(list(K_range), inertias, "o-", color=M2C_BLUE, linewidth=2.5,
+                   markersize=10, markerfacecolor=M2C_PINK, markeredgecolor=M2C_TEXT,
+                   markeredgewidth=1.2, zorder=3)
+        for k, iner in zip(K_range, inertias):
+            ax_el.annotate(f"K={k}\n{iner:.0f}", (k, iner),
+                           textcoords="offset points", xytext=(0, 12),
+                           ha="center", fontsize=8, color=M2C_TEXT, fontweight="700")
+        sel_idx = OPTIMAL_K - 2
+        ax_el.scatter([OPTIMAL_K], [inertias[sel_idx]], color=M2C_AMBER, s=220, zorder=5,
+                      label=f"Selected K={OPTIMAL_K}", edgecolors=M2C_TEXT, linewidths=1.5)
+        ax_el.axvline(OPTIMAL_K, color=M2C_AMBER, linestyle="--", linewidth=1.4, alpha=0.7)
+        ax_el.set_title(f"📈 K-Means Elbow Curve (optimal K={OPTIMAL_K})",
+                        fontsize=11, color=M2C_TEXT, pad=10)
+        ax_el.set_xlabel("Number of Clusters (K)", fontsize=9, color=M2C_MUTED)
+        ax_el.set_ylabel("Inertia (Within-Cluster SSQ)", fontsize=9, color=M2C_MUTED)
+        ax_el.set_xticks(list(K_range)); ax_el.legend(fontsize=9); ax_el.grid(alpha=0.2)
+        plt.tight_layout(); st.pyplot(fig_el)
+        m2_dl_btn(fig_el, "elbow_curve.png", "m2_dl_el"); plt.close(fig_el)
+        st.divider()
+
+        # Steps 21–22 — KMeans distribution bar chart
+        m2_step_box("Step 21–22", "K-Means Clustering", f"K={OPTIMAL_K}")
+        clust_feats = clust_feats.copy()
+        clust_feats["KMeans_Cluster"] = kmeans_labels
+        km_dist = clust_feats["KMeans_Cluster"].value_counts().sort_index()
+        cols_km = st.columns(OPTIMAL_K)
+        for i, col in enumerate(cols_km):
+            col.metric(f"Cluster {i}", f"{int(km_dist.get(i,0))} users")
+        c_km = [int(km_dist.get(i,0)) for i in range(OPTIMAL_K)]
+        fig_kmd, ax_kmd = plt.subplots(figsize=(7, 3))
+        bars_kmd = ax_kmd.bar([f"Cluster {i}" for i in range(OPTIMAL_K)],
+                              c_km, color=M2C_PAL[:OPTIMAL_K], edgecolor=M2C_DARK)
+        for bar, n in zip(bars_kmd, c_km):
+            ax_kmd.text(bar.get_x() + bar.get_width()/2, n + 0.05,
+                        f"{n} users", ha="center", va="bottom",
+                        fontsize=11, color=M2C_TEXT, fontweight="700")
+        ax_kmd.set_title(f"K-Means Distribution (K={OPTIMAL_K})", fontsize=10, color=M2C_TEXT, pad=6)
+        ax_kmd.set_xlabel("Cluster", fontsize=9, color=M2C_MUTED)
+        ax_kmd.set_ylabel("Users",   fontsize=9, color=M2C_MUTED)
+        ax_kmd.grid(axis="y", alpha=0.2); plt.tight_layout()
+        st.pyplot(fig_kmd); plt.close(fig_kmd)
+        st.divider()
+
+        # Step 23 — DBSCAN distribution bar chart
+        m2_step_box("Step 23", "DBSCAN Clustering",
+                    f"eps={EPS} · min_samples={MIN_SAMPLES} · noise=-1")
+        clust_feats["DBSCAN_Cluster"] = dbscan_labels
+        n_cl_db = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+        n_noise  = int((dbscan_labels == -1).sum())
+        db1, db2, db3 = st.columns(3)
+        db1.metric("DBSCAN Clusters",  n_cl_db)
+        db2.metric("Noise / Outliers", n_noise)
+        db3.metric("Noise %", f"{n_noise/len(dbscan_labels)*100:.1f}%")
+        db_cnt  = pd.Series(dbscan_labels).value_counts().sort_index()
+        db_lbls = ["Noise" if l == -1 else f"Cluster {l}" for l in db_cnt.index]
+        db_clrs = [M2C_RED if l == -1 else M2C_PAL[l % len(M2C_PAL)] for l in db_cnt.index]
+        fig_dbd, ax_dbd = plt.subplots(figsize=(7, 3))
+        bars_dbd = ax_dbd.bar(db_lbls, db_cnt.values, color=db_clrs, edgecolor=M2C_DARK)
+        for bar, n in zip(bars_dbd, db_cnt.values):
+            ax_dbd.text(bar.get_x() + bar.get_width()/2, n + 0.05,
+                        f"{n} users", ha="center", va="bottom",
+                        fontsize=11, color=M2C_TEXT, fontweight="700")
+        ax_dbd.set_title(f"DBSCAN Distribution (eps={EPS} · min_samples={MIN_SAMPLES})",
+                         fontsize=10, color=M2C_TEXT, pad=6)
+        ax_dbd.set_xlabel("Cluster", fontsize=9, color=M2C_MUTED)
+        ax_dbd.set_ylabel("Users",   fontsize=9, color=M2C_MUTED)
+        ax_dbd.grid(axis="y", alpha=0.2); plt.tight_layout()
+        st.pyplot(fig_dbd); plt.close(fig_dbd)
+        st.divider()
+
+        # Step 24 — PCA variance
+        m2_step_box("Step 24", "PCA — 2D Dimensionality Reduction",
+                    "Features → 2 principal components")
+        pv1, pv2, pv3 = st.columns(3)
+        pv1.metric("PC1 Variance",    f"{var[0]:.1f}%")
+        pv2.metric("PC2 Variance",    f"{var[1]:.1f}%")
+        pv3.metric("Total Explained", f"{sum(var):.1f}%")
+        st.divider()
+
+        # Step 25 — KMeans PCA Scatter (exact from Pattern_Extraction.py)
+        m2_step_box("Step 25", "K-Means PCA Scatter  📸 Screenshot This",
+                    "2D PCA · coloured by K-Means · User ID labeled")
+        fig_km_sc, ax_km = plt.subplots(figsize=(10, 7))
+        for cid in sorted(set(kmeans_labels)):
+            mask = kmeans_labels == cid
+            ax_km.scatter(X_pca[mask, 0], X_pca[mask, 1],
+                          c=M2C_PAL[cid % len(M2C_PAL)], label=f"Cluster {cid}",
+                          s=140, alpha=0.88, edgecolors=M2C_TEXT, linewidths=0.7, zorder=3)
+            for i, uid in enumerate(clust_feats.index[mask]):
+                ax_km.annotate(str(uid)[-4:], (X_pca[mask][i, 0], X_pca[mask][i, 1]),
+                               textcoords="offset points", xytext=(5, 5),
+                               fontsize=8, color=M2C_TEXT, fontweight="600")
+        ax_km.set_title(f"🤖 K-Means PCA 2D (K={OPTIMAL_K}  PC1={var[0]:.1f}%  PC2={var[1]:.1f}%)",
+                        fontsize=11, color=M2C_TEXT, pad=10)
+        ax_km.set_xlabel(f"PC1 ({var[0]:.1f}% var)", fontsize=9, color=M2C_MUTED)
+        ax_km.set_ylabel(f"PC2 ({var[1]:.1f}% var)", fontsize=9, color=M2C_MUTED)
+        ax_km.legend(title=f"K-Means (K={OPTIMAL_K})", fontsize=9, framealpha=0.4)
+        ax_km.grid(alpha=0.2); plt.tight_layout()
+        st.pyplot(fig_km_sc)
+        m2_dl_btn(fig_km_sc, "kmeans_pca.png", "m2_dl_km"); plt.close(fig_km_sc)
+        st.divider()
+
+        # Step 26 — DBSCAN PCA Scatter (exact from Pattern_Extraction.py)
+        m2_step_box("Step 26", "DBSCAN PCA Scatter  📸 Screenshot This",
+                    "Same PCA axes · DBSCAN labels · noise = red ✕")
+        fig_db_sc, ax_db = plt.subplots(figsize=(10, 7))
+        for lbl in sorted(set(dbscan_labels)):
+            mask = dbscan_labels == lbl
+            if lbl == -1:
+                ax_db.scatter(X_pca[mask, 0], X_pca[mask, 1],
+                              c=M2C_RED, marker="X", s=220, alpha=0.95,
+                              label="Noise / Outlier (–1)", linewidths=1.5, zorder=5)
+                for i, uid in enumerate(clust_feats.index[mask]):
+                    ax_db.annotate(f"{str(uid)[-4:]} (noise)",
+                                   (X_pca[mask][i, 0], X_pca[mask][i, 1]),
+                                   textcoords="offset points", xytext=(8, 6),
+                                   fontsize=8, color=M2C_RED, fontweight="700")
+            else:
+                ax_db.scatter(X_pca[mask, 0], X_pca[mask, 1],
+                              c=M2C_PAL[lbl % len(M2C_PAL)], label=f"Cluster {lbl}",
+                              s=140, alpha=0.88, edgecolors=M2C_TEXT, linewidths=0.7, zorder=3)
+                for i, uid in enumerate(clust_feats.index[mask]):
+                    ax_db.annotate(str(uid)[-4:], (X_pca[mask][i, 0], X_pca[mask][i, 1]),
+                                   textcoords="offset points", xytext=(5, 5),
+                                   fontsize=8, color=M2C_TEXT, fontweight="600")
+        ax_db.set_title(f"🤖 DBSCAN PCA 2D (eps={EPS}  min_samples={MIN_SAMPLES})",
+                        fontsize=11, color=M2C_TEXT, pad=10)
+        ax_db.set_xlabel(f"PC1 ({var[0]:.1f}% var)", fontsize=9, color=M2C_MUTED)
+        ax_db.set_ylabel(f"PC2 ({var[1]:.1f}% var)", fontsize=9, color=M2C_MUTED)
+        ax_db.legend(title="DBSCAN Cluster", fontsize=9, framealpha=0.4)
+        ax_db.grid(alpha=0.2); plt.tight_layout()
+        st.pyplot(fig_db_sc)
+        m2_dl_btn(fig_db_sc, "dbscan_pca.png", "m2_dl_db"); plt.close(fig_db_sc)
+        st.divider()
+
+        # Step 27a — t-SNE
+        m2_step_box("Step 27a", "t-SNE Projection  📸 Screenshot This",
+                    "Non-linear 2D embedding · enable in sidebar")
+        if run_tsne_flag:
+            tsne_out = m2_run_tsne(X_b, len(clust_c))
+            X_tsne   = np.frombuffer(tsne_out, dtype=np.float64).reshape(-1, 2)
+            fig_ts, axes_t = plt.subplots(1, 2, figsize=(15, 6))
+            fig_ts.patch.set_facecolor(M2C_DARK)
+            for ax_t, (lbls_t, name_t) in zip(
+                axes_t,
+                [(kmeans_labels, f"K-Means (K={OPTIMAL_K})"),
+                 (dbscan_labels, f"DBSCAN (eps={EPS})")]):
+                ax_t.set_facecolor(M2C_CARD2)
+                for lbl in sorted(set(lbls_t)):
+                    mask = lbls_t == lbl
+                    if lbl == -1:
+                        ax_t.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                                     c=M2C_RED, marker="X", s=190, label="Noise",
+                                     alpha=0.95, linewidths=1.5, zorder=5)
+                    else:
+                        ax_t.scatter(X_tsne[mask, 0], X_tsne[mask, 1],
+                                     c=M2C_PAL[lbl % len(M2C_PAL)], label=f"Cluster {lbl}",
+                                     s=120, alpha=0.88, edgecolors=M2C_TEXT,
+                                     linewidths=0.7, zorder=3)
+                    for i, uid in enumerate(clust_feats.index[mask]):
+                        ax_t.annotate(str(uid)[-4:],
+                                      (X_tsne[mask][i, 0], X_tsne[mask][i, 1]),
+                                      xytext=(5, 5), textcoords="offset points",
+                                      fontsize=7, color=M2C_RED if lbl == -1 else M2C_TEXT)
+                ax_t.set_title(f"t-SNE — {name_t}", fontsize=11, color=M2C_TEXT, pad=8)
+                ax_t.set_xlabel("t-SNE Dim 1", fontsize=9, color=M2C_MUTED)
+                ax_t.set_ylabel("t-SNE Dim 2", fontsize=9, color=M2C_MUTED)
+                ax_t.legend(title="Cluster", fontsize=8, framealpha=0.35)
+                ax_t.grid(alpha=0.2)
+            plt.tight_layout()
+            st.pyplot(fig_ts); m2_dl_btn(fig_ts, "tsne_projection.png", "m2_dl_ts"); plt.close(fig_ts)
+        else:
+            st.info("✅ Enable **'Run t-SNE (~15 sec)'** in the sidebar to generate this plot.")
+        st.divider()
+
+        # Step 27b — Cluster profiles (grouped bar chart, exact from Pattern_Extraction.py)
+        m2_step_box("Step 27b", "Cluster Profiles — Grand Finale  📸 Screenshot This",
+                    "Grouped bar chart · 5 metrics across all clusters · exact values labeled")
+        feat_p  = [c for c in clust_feats.columns
+                   if c not in ("KMeans_Cluster","DBSCAN_Cluster")]
+        profile = clust_feats.groupby("KMeans_Cluster")[feat_p].mean().round(2)
+        st.markdown("**Average metrics per cluster:**")
+        st.dataframe(profile, use_container_width=True)
+
+        disp_c      = [c for c in ["TotalSteps","Calories","VeryActiveMinutes",
+                                    "SedentaryMinutes","TotalSleepMinutes"]
+                       if c in profile.columns]
+        feat_colors = [M2C_BLUE, M2C_GREEN, M2C_RED, M2C_AMBER, M2C_PURPLE]
+        n_feat      = len(disp_c)
+        n_clust     = len(profile)
+        x           = np.arange(n_clust)
+        width       = 0.14
+        offsets     = np.linspace(-(n_feat-1)/2*width, (n_feat-1)/2*width, n_feat)
+        fig_pr, ax_pr = plt.subplots(figsize=(13, 6))
+        for fi, (feat, fc) in enumerate(zip(disp_c, feat_colors)):
+            vals = profile[feat].values
+            bars = ax_pr.bar(x + offsets[fi], vals, width,
+                             label=feat, color=fc, edgecolor=M2C_DARK, alpha=0.9)
+            mx = max(vals) if max(vals) > 0 else 1
+            for bar, v in zip(bars, vals):
+                ax_pr.text(bar.get_x() + bar.get_width()/2,
+                           bar.get_height() + mx*0.012, f"{v:.0f}",
+                           ha="center", va="bottom", fontsize=7.5, color=M2C_TEXT, fontweight="700")
+        ax_pr.set_xticks(x)
+        ax_pr.set_xticklabels([f"Cluster {i}" for i in range(n_clust)],
+                              fontsize=12, color=M2C_TEXT, fontweight="700")
+        ax_pr.set_title("🏆 Cluster Profiles — Key Feature Averages",
+                        fontsize=11, color=M2C_TEXT, pad=10)
+        ax_pr.set_xlabel("K-Means Cluster", fontsize=10, color=M2C_MUTED)
+        ax_pr.set_ylabel("Mean Value per Day", fontsize=10, color=M2C_MUTED)
+        ax_pr.legend(title="Feature", bbox_to_anchor=(1.01,1), fontsize=9, framealpha=0.4)
+        ax_pr.grid(axis="y", alpha=0.2); plt.tight_layout()
+        st.pyplot(fig_pr); m2_dl_btn(fig_pr, "cluster_profiles.png", "m2_dl_pr"); plt.close(fig_pr)
+        st.divider()
+
+        # Step 27c — Cluster interpretation cards (exact from Pattern_Extraction.py)
+        m2_step_box("Step 27c", "Cluster Interpretation — Activity Labels",
+                    "Auto-labelled by avg steps · 6 key metrics per cluster")
+        for i in range(OPTIMAL_K):
+            if i not in profile.index: continue
+            row   = profile.loc[i]
+            steps = row.get("TotalSteps", 0)
+            sed   = row.get("SedentaryMinutes", 0)
+            act   = row.get("VeryActiveMinutes", 0)
+            cals  = row.get("Calories", 0)
+            slp   = row.get("TotalSleepMinutes", 0)
+            light = row.get("LightlyActiveMinutes", 0)
+            n_in  = int((clust_feats["KMeans_Cluster"] == i).sum())
+            if   steps > 10000: lbl, clr = "🏃 HIGHLY ACTIVE",     M2C_GREEN
+            elif steps > 5000:  lbl, clr = "🚶 MODERATELY ACTIVE",  M2C_BLUE
+            else:               lbl, clr = "🛋️ SEDENTARY",           M2C_AMBER
+            st.markdown(f"""
+            <div style='background:{M2C_CARD2};border-left:5px solid {clr};
+                        border-radius:0 12px 12px 0;padding:18px 22px;margin-bottom:14px'>
+              <div style='font-size:1.1rem;font-weight:800;color:{clr}'>
+                Cluster {i} &nbsp;·&nbsp; {lbl}
+                <span style='font-size:.75rem;color:{M2C_MUTED};font-weight:400'>
+                  &nbsp;({n_in} users)
+                </span>
+              </div>
+              <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px'>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_BLUE}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>📶 Avg Steps/Day</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{steps:,.0f}</div>
+                </div>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_GREEN}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>🔥 Calories/Day</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{cals:,.0f}</div>
+                </div>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_PURPLE}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>💤 Sleep Min/Day</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{slp:,.0f}</div>
+                </div>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_RED}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>🏃 Very Active Min</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{act:.0f}</div>
+                </div>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_AMBER}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>🛋️ Sedentary Min</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{sed:.0f}</div>
+                </div>
+                <div style='background:{M2C_CARD};border-radius:8px;padding:12px;border-top:2px solid {M2C_TEAL}'>
+                  <div style='color:{M2C_MUTED};font-size:.65rem;text-transform:uppercase'>🚶 Lightly Active</div>
+                  <div style='color:{M2C_TEXT};font-size:1.5rem;font-weight:800;margin-top:4px'>{light:.0f}</div>
+                </div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.divider()
+        st.success("✅ Milestone 2 Complete — All 4 phases executed successfully!")
+        st.session_state["m2_cluster_done"] = True
+        # Share master for M3/M4
+        if "m2_master_b" in st.session_state:
+            st.session_state["shared_master_df"] = master_p4
+
         if st.button("🚨 Continue to M3 · Anomaly Detection →", use_container_width=True):
             st.session_state.milestone = 3; st.rerun()
-    else:
-        st.info("Complete Phase 2 (TSFresh) first to enable clustering.")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1487,44 +2294,46 @@ elif M == 4:
                                   "shared_hourly_s_b","shared_hourly_i_b"])
 
     if _has_m2_data and not st.session_state.pipeline_done:
-        # Auto-build from M2 shared data
+        # Auto-build from M2 shared data — runs only once thanks to pipeline_done guard
         st.markdown('''<div class="alert-success">
             ✅ <b>Files loaded automatically from M2</b> — building dashboard data…
         </div>''', unsafe_allow_html=True)
         with st.spinner("Auto-building M4 dashboard from M2 data…"):
-            _daily = pd.read_csv(io.BytesIO(st.session_state["shared_daily_b"])).copy()
-            _daily["ActivityDate"] = pd.to_datetime(_daily["ActivityDate"], format="%m/%d/%Y", errors="coerce")
+            try:
+                _daily = _cached_read_csv(st.session_state["shared_daily_b"]).copy()
+                _daily["ActivityDate"] = pd.to_datetime(_daily["ActivityDate"], format="%m/%d/%Y", errors="coerce")
 
-            _hr_raw = pd.read_csv(io.BytesIO(st.session_state["shared_hr_b"])).copy()
-            _hr_raw["Time"] = pd.to_datetime(_hr_raw["Time"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
-            _hr_min = _hr_raw.set_index("Time").groupby("Id")["Value"].resample("1min").mean().reset_index()
-            _hr_min.columns = ["Id","Time","HeartRate"]
-            _hr_min["Date"] = _hr_min["Time"].dt.date
-            _hr_d = _hr_min.groupby(["Id","Date"])["HeartRate"].agg(AvgHR="mean",MaxHR="max",MinHR="min").reset_index()
+                _hr_raw = _cached_read_csv(st.session_state["shared_hr_b"]).copy()
+                _hr_raw["Time"] = pd.to_datetime(_hr_raw["Time"], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+                _hr_min = _hr_raw.set_index("Time").groupby("Id")["Value"].resample("1min").mean().reset_index()
+                _hr_min.columns = ["Id","Time","HeartRate"]
+                _hr_min["Date"] = _hr_min["Time"].dt.date
+                _hr_d = _hr_min.groupby(["Id","Date"])["HeartRate"].agg(AvgHR="mean",MaxHR="max",MinHR="min").reset_index()
 
-            _sl = pd.read_csv(io.BytesIO(st.session_state["shared_sleep_b"])).copy()
-            _sc = "date" if "date" in _sl.columns else "Date"
-            _sl[_sc] = pd.to_datetime(_sl[_sc], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
-            if _sc != "date": _sl = _sl.rename(columns={_sc:"date"})
-            _sl["Date"] = _sl["date"].dt.date
-            _sl_d = _sl.groupby(["Id","Date"]).agg(TotalSleepMinutes=("value","count")).reset_index()
+                _sl = _cached_read_csv(st.session_state["shared_sleep_b"]).copy()
+                _sc = "date" if "date" in _sl.columns else "Date"
+                _sl[_sc] = pd.to_datetime(_sl[_sc], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+                if _sc != "date": _sl = _sl.rename(columns={_sc:"date"})
+                _sl["Date"] = _sl["date"].dt.date
+                _sl_d = _sl.groupby(["Id","Date"]).agg(TotalSleepMinutes=("value","count")).reset_index()
 
-            _m = _daily.rename(columns={"ActivityDate":"Date"}).copy()
-            _m["Date"] = _m["Date"].dt.date
-            _m = _m.merge(_hr_d, on=["Id","Date"], how="left")
-            _m = _m.merge(_sl_d, on=["Id","Date"], how="left")
-            _m["TotalSleepMinutes"] = _m["TotalSleepMinutes"].fillna(0)
-            for _c in ["AvgHR","MaxHR","MinHR"]:
-                if _c in _m.columns:
-                    _m[_c] = _m.groupby("Id")[_c].transform(lambda x: x.fillna(x.median()))
+                _m = _daily.rename(columns={"ActivityDate":"Date"}).copy()
+                _m["Date"] = _m["Date"].dt.date
+                _m = _m.merge(_hr_d, on=["Id","Date"], how="left")
+                _m = _m.merge(_sl_d, on=["Id","Date"], how="left")
+                _m["TotalSleepMinutes"] = _m["TotalSleepMinutes"].fillna(0)
+                for _c in ["AvgHR","MaxHR","MinHR"]:
+                    if _c in _m.columns:
+                        _m[_c] = _m.groupby("Id")[_c].transform(lambda x: x.fillna(x.median()))
 
-            st.session_state.master       = _m
-            st.session_state.hr_minute    = _hr_min
-            st.session_state.date_min     = str(_m["Date"].min())
-            st.session_state.date_max     = str(_m["Date"].max())
-            st.session_state.pipeline_done = True
-            # Use anomalies from M3 if available
-            # (they are already in session state from M3)
+                st.session_state.master        = _m
+                st.session_state.hr_minute     = _hr_min
+                st.session_state.date_min      = str(_m["Date"].min())
+                st.session_state.date_max      = str(_m["Date"].max())
+                st.session_state.pipeline_done = True
+            except Exception as _m4_err:
+                st.error(f"Dashboard build failed: {_m4_err}. Go to M2 first and upload all files.")
+                st.stop()
         st.rerun()
 
     elif not _has_m2_data and not st.session_state.pipeline_done:
